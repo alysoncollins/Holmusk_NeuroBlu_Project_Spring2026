@@ -66,7 +66,7 @@ SELECT
     cs.person_id,
     cd.index_date,
     cd.diagnosis_type,
-    AVG(cs.value_as_number) AS avg_followup_score, -- Average follow-up cognitive score (any patient with >= 1 diagnosis)
+    --AVG(cs.value_as_number) AS avg_followup_score, -- Average follow-up cognitive score (any patient with >= 1 diagnosis)
     COUNT(cs.value_as_number) AS total_tests_after_index, -- Total number of qualifying cognitive tests after index
     MAX(cs.measurement_date) AS last_test_date, -- Most recent cognitive assessment date
     DATEDIFF(op.observation_period_end_date, cd.index_date) -- Calculates total observatio time after index date
@@ -84,5 +84,5 @@ GROUP BY
     cd.diagnosis_type, 
     op.observation_period_end_date
 HAVING DATEDIFF(op.observation_period_end_date, cd.index_date) >= 180 -- Enforces at least 6 months (180) of observation after index date
-ORDER BY avg_followup_score ASC
+--ORDER BY avg_followup_score ASC
 LIMIT 100;
