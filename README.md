@@ -100,17 +100,6 @@ Cognitive trajectory is classified as **Improved**, **Stable**, or **Worse** bas
 | 5 — Visualization & Analysis | Apr 11 – Apr 17 | SHAP analysis, boxplots, histograms, interpretation |
 | 6 — Finalization | Apr 18 – Apr 24 | Final documentation, presentation, model refinement |
 
----
-
-## Repository Structure
-
-```
-Holmusk_NeuroBlu_Project_Spring2026/
-├── README.md
-└── CLAUDE.md
-```
-
-> This structure will be updated as code, notebooks, and documentation are added throughout the semester.
 
 ---
 
