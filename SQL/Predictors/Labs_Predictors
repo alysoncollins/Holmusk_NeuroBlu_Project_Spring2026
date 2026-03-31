@@ -28,18 +28,14 @@ ranked AS (
             PARTITION BY person_id, measurement_concept_id
             ORDER BY measurement_datetime DESC, measurement_id DESC
         ) AS rn,
-        LAG(value_as_number) OVER ( --gathers previous value before most recent
+        LAG(value_as_number) OVER ( --gathers previous value of the same laboratory
             PARTITION BY person_id, measurement_concept_id
             ORDER BY measurement_datetime ASC, measurement_id ASC
         ) AS previous_score,
-        LAG(measurement_datetime) OVER ( --gathers previous datetime
+        LAG(measurement_datetime) OVER ( --gathers previous datetime of the same laboratory
             PARTITION BY person_id, measurement_concept_id
             ORDER BY measurement_datetime ASC, measurement_id ASC
-        ) AS previous_score_datetime,
-        LAG(measurement_concept_id) OVER ( --gathers previous concept_id
-            PARTITION BY person_id, measurement_concept_id
-            ORDER BY measurement_datetime ASC, measurement_id ASC
-        ) AS previous_score_concept
+        ) AS previous_score_datetime
         
     FROM labs_cohort
 ),
@@ -66,7 +62,6 @@ most_recent AS (
         value_as_number AS most_recent_score,
         previous_score,
         previous_score_datetime,
-        previous_score_concept,
         measurement_datetime
     FROM ranked
     WHERE rn = 1
