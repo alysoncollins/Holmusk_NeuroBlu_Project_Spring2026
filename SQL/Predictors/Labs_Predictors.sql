@@ -110,7 +110,7 @@ flag AS (
 SELECT
     m.person_id,
     m.measurement_concept_id,
-    cn.concept_name,
+    cn.concept_name AS measurement_procedure_concept_name,
     m.most_recent_score,
     m.previous_score,
     FORMAT_NUMBER(s.rolling_mean_90d,5) AS rolling_mean_90d,
