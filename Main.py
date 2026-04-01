@@ -9,6 +9,7 @@ from sklearn.preprocessing import LabelEncoder
 import numpy as np
 import shap
 import matplotlib.pyplot as plt
+np.bool = bool #fix for mismatched numpy and shap version
 
 
 
@@ -67,6 +68,10 @@ def preprocess(dataframe):
     df = df.dropna(subset=['age_at_index', 'sex', 'race', 'ethnicity',
                             'first_score', 'score_delta', 'last_score', 'avg_followup_score'])
     
+    datetime_cols = df.select_dtypes(include=['datetime64']).columns.tolist()
+    for col in datetime_cols:
+        df[col] = (df[col] - pd.Timestamp("1970-01-01")).dt.days
+    
     return df, encoders
 
 def get_feature_importance(model, feature_names, target_names):
@@ -80,7 +85,7 @@ def get_feature_importance(model, feature_names, target_names):
     importance_df['average_importance'] = importance_df.mean(axis=1)
     importance_df = importance_df.sort_values('average_importance', ascending=False)
     
-    return importance_df
+    return importance_df.head(20)
 
 def shap_plots(rf_model, X_test, feature_names, target_names):
 
@@ -152,7 +157,7 @@ def saveDF():
     
 
 def readDF():
-    return nb.get_df("Cohort_Table")
+    return nb.get_df("Drug_Cohort")
     
 
 if __name__ == "__main__":

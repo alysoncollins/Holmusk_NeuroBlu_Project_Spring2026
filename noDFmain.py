@@ -1,4 +1,4 @@
-from Cutoff_Script import Master_Cohort
+from Testing_Script import Master_Cohort
 import pandas as pd
 import neuroblu as nb
 from sklearn.ensemble import RandomForestRegressor
