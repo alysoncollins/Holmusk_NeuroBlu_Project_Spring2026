@@ -118,3 +118,11 @@ This project is part of a multi-semester research collaboration between USI and 
 
 - **NeuroBlu coding environment:** [app.neuroblu.ai](https://app.neuroblu.ai)
 - **Shared files:** Microsoft Teams / OneDrive — USI-Holmusk NeuroBlu Research group
+
+---
+
+## How to run
+
+Access to the NeuroBlu platform is required to access their data pipeline
+-First download the code from the repository and upload the python files to Neuroblu's code studio application
+-To run the model, run the `noDFmain.py` if running from a clean state or `Main.py` if you are loading in a pre-existing dataframe
