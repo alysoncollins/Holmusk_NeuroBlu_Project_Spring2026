@@ -28,18 +28,14 @@ ranked AS (
             PARTITION BY person_id, measurement_concept_id
             ORDER BY measurement_datetime DESC, measurement_id DESC
         ) AS rn,
-        LAG(value_as_number) OVER ( --gathers previous value before most recent
+        LAG(value_as_number) OVER ( --gathers previous value of the same laboratory
             PARTITION BY person_id, measurement_concept_id
             ORDER BY measurement_datetime ASC, measurement_id ASC
         ) AS previous_score,
-        LAG(measurement_datetime) OVER ( --gathers previous datetime
+        LAG(measurement_datetime) OVER ( --gathers previous datetime of the same laboratory
             PARTITION BY person_id, measurement_concept_id
             ORDER BY measurement_datetime ASC, measurement_id ASC
-        ) AS previous_score_datetime,
-        LAG(measurement_concept_id) OVER ( --gathers previous concept_id
-            PARTITION BY person_id, measurement_concept_id
-            ORDER BY measurement_datetime ASC, measurement_id ASC
-        ) AS previous_score_concept
+        ) AS previous_score_datetime
         
     FROM labs_cohort
 ),
@@ -66,7 +62,6 @@ most_recent AS (
         value_as_number AS most_recent_score,
         previous_score,
         previous_score_datetime,
-        previous_score_concept,
         measurement_datetime
     FROM ranked
     WHERE rn = 1
@@ -88,6 +83,28 @@ rolling_stats AS (
         AND r.measurement_concept_id = m.measurement_concept_id
     WHERE r.measurement_datetime BETWEEN m.measurement_datetime - INTERVAL 90 DAYS AND m.measurement_datetime
     GROUP BY r.person_id, r.measurement_concept_id
+),
+
+flag AS (
+    SELECT
+        r.person_id,
+        r.measurement_concept_id,
+        r.measurement_datetime,
+        r.value_as_number,
+        m.range_low,
+        m.range_high,
+        CASE
+            WHEN m.range_low IS NULL AND m.range_high IS NULL THEN NULL  -- no range data, can't flag
+            WHEN r.value_as_number < m.range_low THEN 1                  -- below range
+            WHEN r.value_as_number > m.range_high THEN 1                 -- above range
+            ELSE 0
+        END AS abnormal_flag
+    FROM ranked r
+    INNER JOIN measurement m
+        ON r.person_id = m.person_id
+        AND r.measurement_concept_id = m.measurement_concept_id
+        AND r.measurement_datetime = m.measurement_datetime
+    WHERE r.rn = 1  -- only flag the most recent measurement, matching most_recent CTE logic
 )
 
 SELECT
@@ -97,14 +114,19 @@ SELECT
     m.most_recent_score,
     m.previous_score,
     FORMAT_NUMBER(s.rolling_mean_90d,5) AS rolling_mean_90d,
-    FORMAT_NUMBER(s.rolling_median_90d,5) AS rolling_median_90d
+    FORMAT_NUMBER(s.rolling_median_90d,5) AS rolling_median_90d,
+    f.abnormal_flag       -- new column
+    --f.range_low,           -- optional, remove for final
+    --f.range_high 
     
 FROM most_recent m
 LEFT JOIN rolling_stats s
     ON m.person_id = s.person_id
     AND m.measurement_concept_id = s.measurement_concept_id
 LEFT JOIN concept_names cn ON m.measurement_concept_id = cn.concept_id
-WHERE m.previous_score IS NOT NULL
+LEFT JOIN flag f                            
+    ON m.person_id = f.person_id
+    AND m.measurement_concept_id = f.measurement_concept_id
+WHERE m.previous_score IS NOT NULL 
+    --AND f.abnormal_flag IS NOT NULL
 ORDER BY m.person_id
-
-LIMIT 1000;  --limited to save on query time
