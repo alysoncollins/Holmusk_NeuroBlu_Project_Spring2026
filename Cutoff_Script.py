@@ -54,7 +54,7 @@ EligibleCohort AS (
     FROM CohortDiagnosis cd
     JOIN ObsPeriod op
         ON cd.person_id = op.person_id
-    WHERE DATEDIFF(op.observation_period_end_date, cd.index_date) >= 180
+    WHERE DATEDIFF('day', cd.index_date, op.observation_period_end_date) >= 180
       AND EXISTS (
           SELECT 1
           FROM drug_exposure de
