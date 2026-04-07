@@ -13,4 +13,4 @@ m.patient_id
 FROM measurement m
 JOIN measurement_lookup ml
 ON m.measurement_concept_id = ml.measurement_concept_id
-WHERE m.measurement_concept_id = 4169175 and m.value_as_number is not null
+WHERE ml.scale = 'mmse' and m.value_as_number is not null

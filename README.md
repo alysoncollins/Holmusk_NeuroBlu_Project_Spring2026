@@ -11,6 +11,8 @@ This project builds a machine learning pipeline to identify which clinical varia
 
 Data is sourced from the NeuroBlu platform, which uses the OMOP Common Data Model (CDM). The pipeline covers cohort construction, feature engineering, model training, and explainability analysis using SHAP values.
 
+More details about specific files and modeling techniques are available on the wiki for this repository.
+
 ---
 
 ## Team
@@ -85,7 +87,6 @@ Cognitive trajectory is classified as **Improved**, **Stable**, or **Worse** bas
 | Data Split | Train / Validation / Test |
 | Prediction Horizon | 6 or 12 months (TBD) |
 | Explainability | SHAP — global feature importance, top 20 variables, summary and dependence plots |
-| Outlier Detection | Isolation Forest (used in place of LOF due to memory constraints at large sample sizes) |
 
 ---
 

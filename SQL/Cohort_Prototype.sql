@@ -23,13 +23,13 @@ CohortDiagnosis AS (
     SELECT
         co.person_id,
         MIN(co.condition_start_date) AS index_date, -- MIN is used to define the index date as the first diagnosis of MCI, Dementia, or Alzheimer's disease
-        MAX(c.concept_name) AS diagnosis_type -- MAX is used to retain a readable diagnosis label
+        MAX(d.icd_name) AS diagnosis_type -- MAX is used to retain a readable diagnosis label
     FROM condition_occurrence co
-    JOIN concept c
-    ON co.condition_concept_id = c.concept_id
-    WHERE c.concept_name LIKE '%mild cognitive% impairment%' -- OR is used since it can be any of the three
-       OR c.concept_name LIKE '%dementia%'
-       OR c.concept_name LIKE '%alzheimer%'
+    JOIN diagnosis_lookup d
+    ON co.condition_concept_id = d.icd_concept_id
+    WHERE d.icd_name LIKE '%mild cognitive% impairment%' -- OR is used since it can be any of the three
+       OR d.icd_name LIKE '%dementia%'
+       OR d.icd_name LIKE '%alzheimer%'
     GROUP BY co.person_id
 ),
  
