@@ -1,4 +1,3 @@
-#This script contains Master_Cohort() which returns the Cohort for the project using relative cutoff as the standardization
 def Master_Cohort():
     return """
 -- Identify target drug concept IDs (brand-name based)
@@ -18,7 +17,6 @@ WITH DrugsUsed AS (
         OR brand_name LIKE '%risperdal%'
 ),
 
--- First diagnosis date of MCI OR Dementia OR Alzheimer's
 CohortDiagnosis AS (
     SELECT
         co.person_id,
@@ -34,7 +32,6 @@ CohortDiagnosis AS (
     HAVING MIN(co.condition_start_date) IS NOT NULL
 ),
 
--- One observation period row per patient using the latest end date
 ObsPeriod AS (
     SELECT
         person_id,
@@ -44,7 +41,6 @@ ObsPeriod AS (
     GROUP BY person_id
 ),
 
--- Cohort eligibility: diagnosis + drug exposure + 180d observation + at least one cognitive score
 EligibleCohort AS (
     SELECT
         cd.person_id,
@@ -62,7 +58,6 @@ EligibleCohort AS (
           WHERE de.person_id = cd.person_id
             AND de.drug_exposure_start_date >= cd.index_date
       )
-      -- Require at least one valid cognitive score after index date
       AND EXISTS (
           SELECT 1
           FROM measurement m
@@ -78,25 +73,25 @@ EligibleCohort AS (
       )
 ),
 
--- Cutoff parameters per scale
 TestCutoffs AS (
     SELECT 'minicog' AS scale, 3.0  AS cutoff, 5.0  AS upper_bound
     UNION ALL SELECT 'mmse',   24.0,            30.0
     UNION ALL SELECT 'moca',   26.0,            30.0
 ),
 
--- Standardized cognitive scores for eligible patients only
 CognitiveScores AS (
     SELECT
         m.person_id,
         m.measurement_date,
         ml.scale,
-        CASE
-            WHEN m.value_as_number = tc.cutoff THEN 0
-            WHEN m.value_as_number < tc.cutoff THEN -(tc.cutoff - m.value_as_number) / tc.cutoff
-            WHEN m.value_as_number > tc.cutoff THEN  (m.value_as_number - tc.cutoff) / (tc.upper_bound - tc.cutoff)
-            ELSE NULL
-        END AS cutoff_score
+        AVG(
+            CASE
+                WHEN m.value_as_number = tc.cutoff THEN 0
+                WHEN m.value_as_number < tc.cutoff THEN -(tc.cutoff - m.value_as_number) / tc.cutoff
+                WHEN m.value_as_number > tc.cutoff THEN  (m.value_as_number - tc.cutoff) / (tc.upper_bound - tc.cutoff)
+                ELSE NULL
+            END
+        ) AS cutoff_score
     FROM measurement m
     JOIN (
         SELECT custom2_str, scale
@@ -110,66 +105,90 @@ CognitiveScores AS (
         ON m.person_id = ec.person_id
     WHERE m.value_as_number IS NOT NULL
         AND m.measurement_date >= ec.index_date
+        AND m.measurement_date <= ec.index_date + INTERVAL 730 DAY
+    GROUP BY
+        m.person_id,
+        m.measurement_date,
+        ml.scale
 ),
 
--- Average, first, and last cognitive scores computed in a single scan
-CogScoreAgg AS (
+CogScoreRanked AS (
     SELECT
         person_id,
-        AVG(cutoff_score)                                 AS avg_followup_score,
-        MIN(CASE WHEN rn_asc  = 1 THEN cutoff_score END) AS first_score,
-        MIN(CASE WHEN rn_desc = 1 THEN cutoff_score END) AS last_score
-    FROM (
-        SELECT
-            person_id,
-            cutoff_score,
-            ROW_NUMBER() OVER (
-                PARTITION BY person_id
-                ORDER BY measurement_date ASC NULLS LAST
-            ) AS rn_asc,
-            ROW_NUMBER() OVER (
-                PARTITION BY person_id
-                ORDER BY measurement_date DESC NULLS LAST
-            ) AS rn_desc
-        FROM CognitiveScores
-    ) ranked
-    GROUP BY person_id
+        measurement_date,
+        scale,
+        cutoff_score,
+        ROW_NUMBER() OVER (
+            PARTITION BY person_id
+            ORDER BY measurement_date ASC NULLS LAST
+        ) AS test_sequence_number,
+        LAG(cutoff_score) OVER (
+            PARTITION BY person_id
+            ORDER BY measurement_date ASC NULLS LAST
+        ) AS prev_score,
+        LAG(measurement_date) OVER (
+            PARTITION BY person_id
+            ORDER BY measurement_date ASC NULLS LAST
+        ) AS prev_test_date
+    FROM CognitiveScores
 ),
 
--- Drug exposure windows scoped to eligible patients only
+CogScoreWithDelta AS (
+    SELECT
+        person_id,
+        measurement_date,
+        scale,
+        cutoff_score,
+        test_sequence_number,
+        prev_score,
+        prev_test_date,
+        cutoff_score - prev_score AS score_delta_from_last,
+        CASE
+            WHEN prev_score IS NULL          THEN 'BASELINE'
+            WHEN cutoff_score > prev_score   THEN 'IMPROVED'
+            WHEN cutoff_score < prev_score   THEN 'WORSE'
+            ELSE                                  'STABLE'
+        END AS trajectory
+    FROM CogScoreRanked
+    WHERE prev_score IS NOT NULL
+),
+
 drug_cohort AS (
     SELECT
         de.person_id,
         de.drug_concept_id,
         ec.index_date,
+        csr.measurement_date AS test_date,
         (DATEDIFF('day',
             de.drug_exposure_start_date,
             COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
         ) + 1) AS cumulative_days_exposed,
         CASE
-            WHEN de.drug_exposure_start_date <= DATE_ADD(ec.index_date, 30)
-             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date) >= ec.index_date
+            WHEN de.drug_exposure_start_date <= csr.measurement_date
+             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
+                 >= csr.measurement_date - INTERVAL 30 DAY
             THEN 1 ELSE 0
         END AS exposed_0_30d,
         CASE
-            WHEN de.drug_exposure_start_date <= DATE_ADD(ec.index_date, 90)
-             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date) >= DATE_ADD(ec.index_date, 31)
+            WHEN de.drug_exposure_start_date <= csr.measurement_date - INTERVAL 31 DAY
+             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
+                 >= csr.measurement_date - INTERVAL 90 DAY
             THEN 1 ELSE 0
         END AS exposed_31_90d,
         CASE
-            WHEN de.drug_exposure_start_date <= DATE_ADD(ec.index_date, 180)
-             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date) >= DATE_ADD(ec.index_date, 91)
+            WHEN de.drug_exposure_start_date <= csr.measurement_date - INTERVAL 91 DAY
+             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
+                 >= csr.measurement_date - INTERVAL 180 DAY
             THEN 1 ELSE 0
         END AS exposed_91_180d
     FROM drug_exposure de
-    INNER JOIN EligibleCohort ec
+    JOIN CogScoreWithDelta csr
+        ON de.person_id = csr.person_id
+    JOIN EligibleCohort ec
         ON de.person_id = ec.person_id
-    WHERE de.drug_exposure_start_date IS NOT NULL
-        AND de.drug_exposure_start_date >= ec.index_date
-        AND de.drug_exposure_start_date <= DATE_ADD(ec.index_date, 180)
+    WHERE de.drug_exposure_start_date <= csr.measurement_date
 ),
 
--- Drug ingredient and brand metadata for pivot columns
 drug_hierarchy AS (
     SELECT DISTINCT
         dl.drug_concept_id,
@@ -194,10 +213,10 @@ drug_hierarchy AS (
         OR cdim.ingredient_concept_name LIKE '%risperidone%'
 ),
 
--- Drug exposures collapsed to one row per patient per drug per ingredient
 drug_cohort_collapsed AS (
     SELECT
         dc.person_id,
+        dc.test_date,
         dc.drug_concept_id,
         dh.ingredient_level,
         dc.index_date,
@@ -210,12 +229,12 @@ drug_cohort_collapsed AS (
         ON dc.drug_concept_id = dh.drug_concept_id
     GROUP BY
         dc.person_id,
+        dc.test_date,
         dc.drug_concept_id,
         dh.ingredient_level,
         dc.index_date
 ),
 
--- Patient demographics with unknown concepts labeled rather than excluded
 Demographics AS (
     SELECT
         p.person_id,
@@ -223,18 +242,19 @@ Demographics AS (
             WHEN p.year_of_birth IS NULL THEN NULL
             ELSE YEAR(cd.index_date) - p.year_of_birth
         END AS age_at_index,
-        CASE
-            WHEN LOWER(g.concept_name) LIKE '%no matching concept%' OR g.concept_name IS NULL
-            THEN 'Unknown' ELSE g.concept_name
-        END AS sex,
-        CASE
-            WHEN LOWER(r.concept_name) LIKE '%no matching concept%' OR r.concept_name IS NULL
-            THEN 'Unknown' ELSE r.concept_name
-        END AS race,
-        CASE
-            WHEN LOWER(e.concept_name) LIKE '%no matching concept%' OR e.concept_name IS NULL
-            THEN 'Unknown' ELSE e.concept_name
-        END AS ethnicity
+        CASE WHEN LOWER(g.concept_name) = 'male'                                      THEN 1 ELSE 0 END AS sex_male,
+        CASE WHEN LOWER(g.concept_name) = 'female'                                    THEN 1 ELSE 0 END AS sex_female,
+        CASE WHEN LOWER(g.concept_name) = 'no matching concept' OR g.concept_name IS NULL THEN 1 ELSE 0 END AS sex_unknown,
+        CASE WHEN LOWER(r.concept_name) = 'white'                                     THEN 1 ELSE 0 END AS race_white,
+        CASE WHEN LOWER(r.concept_name) = 'black or african american'                 THEN 1 ELSE 0 END AS race_black_or_african_american,
+        CASE WHEN LOWER(r.concept_name) = 'asian'                                     THEN 1 ELSE 0 END AS race_asian,
+        CASE WHEN LOWER(r.concept_name) = 'american indian or alaska native'          THEN 1 ELSE 0 END AS race_american_indian_or_alaska_native,
+        CASE WHEN LOWER(r.concept_name) = 'native hawaiian or other pacific islander' THEN 1 ELSE 0 END AS race_native_hawaiian_or_other_pacific_islander,
+        CASE WHEN LOWER(r.concept_name) = 'other race'                                THEN 1 ELSE 0 END AS race_other,
+        CASE WHEN LOWER(r.concept_name) = 'no matching concept' OR r.concept_name IS NULL THEN 1 ELSE 0 END AS race_unknown,
+        CASE WHEN LOWER(e.concept_name) = 'not hispanic or latino'                    THEN 1 ELSE 0 END AS ethnicity_not_hispanic_or_latino,
+        CASE WHEN LOWER(e.concept_name) = 'hispanic or latino'                        THEN 1 ELSE 0 END AS ethnicity_hispanic_or_latino,
+        CASE WHEN LOWER(e.concept_name) = 'no matching concept' OR e.concept_name IS NULL THEN 1 ELSE 0 END AS ethnicity_unknown
     FROM person p
     JOIN EligibleCohort cd
         ON p.person_id = cd.person_id
@@ -243,103 +263,106 @@ Demographics AS (
     LEFT JOIN concept e ON p.ethnicity_concept_id = e.concept_id
 )
 
--- Final output: one row per patient per drug exposure record
 SELECT
     ec.person_id,
-    csa.first_score,
-    csa.last_score,
-    (csa.last_score - csa.first_score) AS score_delta,
-    csa.avg_followup_score,
-    d.age_at_index,
-    d.sex,
-    d.race,
-    d.ethnicity,
     ec.index_date,
-
-    -- Haloperidol
+    csr.cutoff_score,
+    csr.measurement_date AS test_date,
+    csr.prev_test_date,
+    csr.prev_score,
+    csr.score_delta_from_last,
+    csr.trajectory,
+    d.age_at_index,
+    d.sex_male,
+    d.sex_female,
+    d.sex_unknown,
+    d.race_white,
+    d.race_black_or_african_american,
+    d.race_asian,
+    d.race_american_indian_or_alaska_native,
+    d.race_native_hawaiian_or_other_pacific_islander,
+    d.race_other,
+    d.race_unknown,
+    d.ethnicity_not_hispanic_or_latino,
+    d.ethnicity_hispanic_or_latino,
+    d.ethnicity_unknown,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.cumulative_days_exposed END), 0) AS haloperidol_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_0_30d END), 0)          AS haloperidol_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_31_90d END), 0)         AS haloperidol_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_91_180d END), 0)        AS haloperidol_91_180d,
-
-    -- Lecanemab
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.cumulative_days_exposed END), 0) AS lecanemab_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_0_30d END), 0)           AS lecanemab_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_31_90d END), 0)          AS lecanemab_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_91_180d END), 0)         AS lecanemab_91_180d,
-
-    -- Donanemab
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.cumulative_days_exposed END), 0) AS donanemab_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_0_30d END), 0)           AS donanemab_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_31_90d END), 0)          AS donanemab_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_91_180d END), 0)         AS donanemab_91_180d,
-
-    -- Brexpiprazole
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.cumulative_days_exposed END), 0) AS brexpiprazole_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_0_30d END), 0)           AS brexpiprazole_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_31_90d END), 0)          AS brexpiprazole_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_91_180d END), 0)         AS brexpiprazole_91_180d,
-
-    -- Memantine
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.cumulative_days_exposed END), 0) AS memantine_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_0_30d END), 0)           AS memantine_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_31_90d END), 0)          AS memantine_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_91_180d END), 0)         AS memantine_91_180d,
-
-    -- Donepezil
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.cumulative_days_exposed END), 0) AS donepezil_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_0_30d END), 0)           AS donepezil_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_31_90d END), 0)          AS donepezil_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_91_180d END), 0)         AS donepezil_91_180d,
-
-    -- Rivastigmine
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.cumulative_days_exposed END), 0) AS rivastigmine_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_0_30d END), 0)           AS rivastigmine_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_31_90d END), 0)          AS rivastigmine_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_91_180d END), 0)         AS rivastigmine_91_180d,
-
-    -- Galantamine
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.cumulative_days_exposed END), 0) AS galantamine_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_0_30d END), 0)           AS galantamine_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_31_90d END), 0)          AS galantamine_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_91_180d END), 0)         AS galantamine_91_180d,
-
-    -- Benzgalantamine
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.cumulative_days_exposed END), 0) AS benzgalantamine_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_0_30d END), 0)           AS benzgalantamine_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_31_90d END), 0)          AS benzgalantamine_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_91_180d END), 0)         AS benzgalantamine_91_180d,
-
-    -- Suvorexant
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.cumulative_days_exposed END), 0) AS suvorexant_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_0_30d END), 0)           AS suvorexant_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_31_90d END), 0)          AS suvorexant_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_91_180d END), 0)         AS suvorexant_91_180d,
-
-    -- Risperidone
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.cumulative_days_exposed END), 0) AS risperidone_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_0_30d END), 0)           AS risperidone_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_31_90d END), 0)          AS risperidone_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_91_180d END), 0)         AS risperidone_91_180d
-
 FROM EligibleCohort ec
 JOIN Demographics d
     ON ec.person_id = d.person_id
+JOIN CogScoreWithDelta csr
+    ON ec.person_id = csr.person_id
 JOIN drug_cohort_collapsed dcc
     ON ec.person_id = dcc.person_id
+    AND dcc.test_date = csr.measurement_date
 LEFT JOIN drug_hierarchy dh
     ON dcc.drug_concept_id = dh.drug_concept_id
-INNER JOIN CogScoreAgg csa
-    ON ec.person_id = csa.person_id
 GROUP BY
     ec.person_id,
     ec.index_date,
     d.age_at_index,
-    d.sex,
-    d.race,
-    d.ethnicity,
-    csa.first_score,
-    csa.last_score,
-    csa.avg_followup_score
-ORDER BY ec.person_id
+    d.sex_male,
+    d.sex_female,
+    d.sex_unknown,
+    d.race_white,
+    d.race_black_or_african_american,
+    d.race_asian,
+    d.race_american_indian_or_alaska_native,
+    d.race_native_hawaiian_or_other_pacific_islander,
+    d.race_other,
+    d.race_unknown,
+    d.ethnicity_not_hispanic_or_latino,
+    d.ethnicity_hispanic_or_latino,
+    d.ethnicity_unknown,
+    csr.measurement_date,
+    csr.scale,
+    csr.cutoff_score,
+    csr.prev_test_date,
+    csr.prev_score,
+    csr.score_delta_from_last,
+    csr.trajectory
+ORDER BY ec.person_id, csr.measurement_date
 """
