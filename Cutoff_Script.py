@@ -105,7 +105,8 @@ CognitiveScores AS (
         ON m.person_id = ec.person_id
     WHERE m.value_as_number IS NOT NULL
         AND m.measurement_date >= ec.index_date
-        AND m.measurement_date <= ec.index_date + INTERVAL 730 DAY
+        AND m.measurement_date <= ec.index_date + INTERVAL (730) DAY
+        AND NOT (ml.scale = 'moca' AND m.value_as_number > 30)
     GROUP BY
         m.person_id,
         m.measurement_date,
@@ -166,19 +167,19 @@ drug_cohort AS (
         CASE
             WHEN de.drug_exposure_start_date <= csr.measurement_date
              AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
-                 >= csr.measurement_date - INTERVAL 30 DAY
+                 >= csr.measurement_date - INTERVAL (30) DAY
             THEN 1 ELSE 0
         END AS exposed_0_30d,
         CASE
-            WHEN de.drug_exposure_start_date <= csr.measurement_date - INTERVAL 31 DAY
+            WHEN de.drug_exposure_start_date <= csr.measurement_date - INTERVAL (31) DAY
              AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
-                 >= csr.measurement_date - INTERVAL 90 DAY
+                 >= csr.measurement_date - INTERVAL (90) DAY
             THEN 1 ELSE 0
         END AS exposed_31_90d,
         CASE
-            WHEN de.drug_exposure_start_date <= csr.measurement_date - INTERVAL 91 DAY
+            WHEN de.drug_exposure_start_date <= csr.measurement_date - INTERVAL (91) DAY
              AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
-                 >= csr.measurement_date - INTERVAL 180 DAY
+                 >= csr.measurement_date - INTERVAL (180) DAY
             THEN 1 ELSE 0
         END AS exposed_91_180d
     FROM drug_exposure de
@@ -219,7 +220,6 @@ drug_cohort_collapsed AS (
         dc.test_date,
         dc.drug_concept_id,
         dh.ingredient_level,
-        dc.index_date,
         SUM(dc.cumulative_days_exposed) AS cumulative_days_exposed,
         MAX(dc.exposed_0_30d)           AS exposed_0_30d,
         MAX(dc.exposed_31_90d)          AS exposed_31_90d,
@@ -231,8 +231,7 @@ drug_cohort_collapsed AS (
         dc.person_id,
         dc.test_date,
         dc.drug_concept_id,
-        dh.ingredient_level,
-        dc.index_date
+        dh.ingredient_level
 ),
 
 Demographics AS (
@@ -242,9 +241,11 @@ Demographics AS (
             WHEN p.year_of_birth IS NULL THEN NULL
             ELSE YEAR(cd.index_date) - p.year_of_birth
         END AS age_at_index,
+
         CASE WHEN LOWER(g.concept_name) = 'male'                                      THEN 1 ELSE 0 END AS sex_male,
         CASE WHEN LOWER(g.concept_name) = 'female'                                    THEN 1 ELSE 0 END AS sex_female,
         CASE WHEN LOWER(g.concept_name) = 'no matching concept' OR g.concept_name IS NULL THEN 1 ELSE 0 END AS sex_unknown,
+
         CASE WHEN LOWER(r.concept_name) = 'white'                                     THEN 1 ELSE 0 END AS race_white,
         CASE WHEN LOWER(r.concept_name) = 'black or african american'                 THEN 1 ELSE 0 END AS race_black_or_african_american,
         CASE WHEN LOWER(r.concept_name) = 'asian'                                     THEN 1 ELSE 0 END AS race_asian,
@@ -252,9 +253,11 @@ Demographics AS (
         CASE WHEN LOWER(r.concept_name) = 'native hawaiian or other pacific islander' THEN 1 ELSE 0 END AS race_native_hawaiian_or_other_pacific_islander,
         CASE WHEN LOWER(r.concept_name) = 'other race'                                THEN 1 ELSE 0 END AS race_other,
         CASE WHEN LOWER(r.concept_name) = 'no matching concept' OR r.concept_name IS NULL THEN 1 ELSE 0 END AS race_unknown,
+
         CASE WHEN LOWER(e.concept_name) = 'not hispanic or latino'                    THEN 1 ELSE 0 END AS ethnicity_not_hispanic_or_latino,
         CASE WHEN LOWER(e.concept_name) = 'hispanic or latino'                        THEN 1 ELSE 0 END AS ethnicity_hispanic_or_latino,
         CASE WHEN LOWER(e.concept_name) = 'no matching concept' OR e.concept_name IS NULL THEN 1 ELSE 0 END AS ethnicity_unknown
+
     FROM person p
     JOIN EligibleCohort cd
         ON p.person_id = cd.person_id
@@ -286,50 +289,73 @@ SELECT
     d.ethnicity_not_hispanic_or_latino,
     d.ethnicity_hispanic_or_latino,
     d.ethnicity_unknown,
+
+    -- Haloperidol
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.cumulative_days_exposed END), 0) AS haloperidol_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_0_30d END), 0)          AS haloperidol_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_31_90d END), 0)         AS haloperidol_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_91_180d END), 0)        AS haloperidol_91_180d,
+
+    -- Lecanemab
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.cumulative_days_exposed END), 0) AS lecanemab_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_0_30d END), 0)           AS lecanemab_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_31_90d END), 0)          AS lecanemab_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_91_180d END), 0)         AS lecanemab_91_180d,
+
+    -- Donanemab
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.cumulative_days_exposed END), 0) AS donanemab_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_0_30d END), 0)           AS donanemab_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_31_90d END), 0)          AS donanemab_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_91_180d END), 0)         AS donanemab_91_180d,
+
+    -- Brexpiprazole
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.cumulative_days_exposed END), 0) AS brexpiprazole_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_0_30d END), 0)           AS brexpiprazole_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_31_90d END), 0)          AS brexpiprazole_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_91_180d END), 0)         AS brexpiprazole_91_180d,
+
+    -- Memantine
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.cumulative_days_exposed END), 0) AS memantine_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_0_30d END), 0)           AS memantine_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_31_90d END), 0)          AS memantine_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_91_180d END), 0)         AS memantine_91_180d,
+
+    -- Donepezil
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.cumulative_days_exposed END), 0) AS donepezil_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_0_30d END), 0)           AS donepezil_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_31_90d END), 0)          AS donepezil_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_91_180d END), 0)         AS donepezil_91_180d,
+
+    -- Rivastigmine
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.cumulative_days_exposed END), 0) AS rivastigmine_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_0_30d END), 0)           AS rivastigmine_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_31_90d END), 0)          AS rivastigmine_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_91_180d END), 0)         AS rivastigmine_91_180d,
+
+    -- Galantamine
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.cumulative_days_exposed END), 0) AS galantamine_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_0_30d END), 0)           AS galantamine_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_31_90d END), 0)          AS galantamine_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_91_180d END), 0)         AS galantamine_91_180d,
+
+    -- Benzgalantamine
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.cumulative_days_exposed END), 0) AS benzgalantamine_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_0_30d END), 0)           AS benzgalantamine_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_31_90d END), 0)          AS benzgalantamine_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_91_180d END), 0)         AS benzgalantamine_91_180d,
+
+    -- Suvorexant
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.cumulative_days_exposed END), 0) AS suvorexant_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_0_30d END), 0)           AS suvorexant_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_31_90d END), 0)          AS suvorexant_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_91_180d END), 0)         AS suvorexant_91_180d,
+
+    -- Risperidone
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.cumulative_days_exposed END), 0) AS risperidone_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_0_30d END), 0)           AS risperidone_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_31_90d END), 0)          AS risperidone_31_90d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_91_180d END), 0)         AS risperidone_91_180d
+
 FROM EligibleCohort ec
 JOIN Demographics d
     ON ec.person_id = d.person_id
