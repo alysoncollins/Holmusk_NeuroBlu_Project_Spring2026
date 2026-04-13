@@ -227,7 +227,6 @@ drug_cohort_collapsed AS (
         dc.test_date,
         dc.drug_concept_id,
         dh.ingredient_level,
-        dc.index_date,
         SUM(dc.cumulative_days_exposed) AS cumulative_days_exposed,
         MAX(dc.exposed_0_30d)           AS exposed_0_30d,
         MAX(dc.exposed_31_90d)          AS exposed_31_90d,
@@ -239,8 +238,7 @@ drug_cohort_collapsed AS (
         dc.person_id,
         dc.test_date,
         dc.drug_concept_id,
-        dh.ingredient_level,
-        dc.index_date
+        dh.ingredient_level
 ),
 
 -- Patient demographics with unknown concepts labeled rather than excluded
