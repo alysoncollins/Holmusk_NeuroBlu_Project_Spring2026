@@ -107,30 +107,49 @@ CognitiveScores AS (
         ON m.person_id = ec.person_id
     WHERE m.value_as_number IS NOT NULL
         AND m.measurement_date >= ec.index_date
+        AND m.measurement_date <= DATEADD(DAY, 365, ec.index_date)
 ),
 
--- Average, first, and last cognitive scores computed in a single scan
-CogScoreAgg AS (
+-- rank cognitive scores
+CogScoreRanked AS (
     SELECT
         person_id,
-        AVG(cutoff_score)                                 AS avg_followup_score,
-        MIN(CASE WHEN rn_asc  = 1 THEN cutoff_score END) AS first_score,
-        MIN(CASE WHEN rn_desc = 1 THEN cutoff_score END) AS last_score
-    FROM (
-        SELECT
-            person_id,
-            cutoff_score,
-            ROW_NUMBER() OVER (
-                PARTITION BY person_id
-                ORDER BY measurement_date ASC NULLS LAST
-            ) AS rn_asc,
-            ROW_NUMBER() OVER (
-                PARTITION BY person_id
-                ORDER BY measurement_date DESC NULLS LAST
-            ) AS rn_desc
-        FROM CognitiveScores
-    ) ranked
-    GROUP BY person_id
+        measurement_date,
+        scale,
+        cutoff_score,
+        ROW_NUMBER() OVER (
+            PARTITION BY person_id
+            ORDER BY measurement_date ASC NULLS LAST
+        ) AS test_sequence_number,
+        LAG(cutoff_score) OVER (
+            PARTITION BY person_id
+            ORDER BY measurement_date ASC NULLS LAST
+        ) AS prev_score,
+        LAG(measurement_date) OVER (
+            PARTITION BY person_id
+            ORDER BY measurement_date ASC NULLS LAST
+        ) AS prev_test_date
+    FROM CognitiveScores
+),
+
+CogScoreWithDelta AS (
+    SELECT
+        person_id,
+        measurement_date,
+        scale,
+        cutoff_score,
+        test_sequence_number,
+        prev_score,
+        prev_test_date,
+        cutoff_score - prev_score AS score_delta_from_last,
+        CASE
+            WHEN prev_score IS NULL          THEN 'BASELINE'
+            WHEN cutoff_score > prev_score   THEN 'IMPROVED'
+            WHEN cutoff_score < prev_score   THEN 'WORSE'
+            ELSE                                  'STABLE'
+        END AS trajectory
+    FROM CogScoreRanked
+    WHERE prev_score IS NOT NULL
 ),
 
 -- Drug exposure windows scoped to eligible patients only
@@ -139,31 +158,35 @@ drug_cohort AS (
         de.person_id,
         de.drug_concept_id,
         ec.index_date,
+        csr.measurement_date AS test_date,
         (DATEDIFF(DAY,
             de.drug_exposure_start_date,
             COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
         ) + 1) AS cumulative_days_exposed,
         CASE
-            WHEN de.drug_exposure_start_date <= DATE_ADD(ec.index_date, 30)
-             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date) >= ec.index_date
+            WHEN de.drug_exposure_start_date <= csr.measurement_date
+             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
+                 >= DATEADD(DAY, -30, csr.measurement_date)
             THEN 1 ELSE 0
         END AS exposed_0_30d,
         CASE
-            WHEN de.drug_exposure_start_date <= DATE_ADD(ec.index_date, 90)
-             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date) >= DATE_ADD(ec.index_date, 31)
+            WHEN de.drug_exposure_start_date <= DATEADD(DAY, -31, csr.measurement_date)
+             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
+                 >= DATEADD(DAY, -90, csr.measurement_date)
             THEN 1 ELSE 0
         END AS exposed_31_90d,
         CASE
-            WHEN de.drug_exposure_start_date <= DATE_ADD(ec.index_date, 180)
-             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date) >= DATE_ADD(ec.index_date, 91)
+            WHEN de.drug_exposure_start_date <= DATEADD(DAY, -91, csr.measurement_date)
+             AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
+                 >= DATEADD(DAY, -180, csr.measurement_date)
             THEN 1 ELSE 0
         END AS exposed_91_180d
     FROM drug_exposure de
-    INNER JOIN EligibleCohort ec
+    JOIN CogScoreWithDelta csr
+        ON de.person_id = csr.person_id
+    JOIN EligibleCohort ec
         ON de.person_id = ec.person_id
-    WHERE de.drug_exposure_start_date IS NOT NULL
-        AND de.drug_exposure_start_date >= ec.index_date
-        AND de.drug_exposure_start_date <= DATE_ADD(ec.index_date, 180)
+    WHERE de.drug_exposure_start_date <= csr.measurement_date
 ),
 
 -- Drug ingredient and brand metadata for pivot columns
@@ -195,6 +218,7 @@ drug_hierarchy AS (
 drug_cohort_collapsed AS (
     SELECT
         dc.person_id,
+        dc.test_date,
         dc.drug_concept_id,
         dh.ingredient_level,
         dc.index_date,
@@ -207,6 +231,7 @@ drug_cohort_collapsed AS (
         ON dc.drug_concept_id = dh.drug_concept_id
     GROUP BY
         dc.person_id,
+        dc.test_date,
         dc.drug_concept_id,
         dh.ingredient_level,
         dc.index_date
@@ -220,18 +245,26 @@ Demographics AS (
             WHEN p.year_of_birth IS NULL THEN NULL
             ELSE YEAR(cd.index_date) - p.year_of_birth
         END AS age_at_index,
-        CASE
-            WHEN LOWER(g.concept_name) LIKE '%no matching concept%' OR g.concept_name IS NULL
-            THEN 'Unknown' ELSE g.concept_name
-        END AS sex,
-        CASE
-            WHEN LOWER(r.concept_name) LIKE '%no matching concept%' OR r.concept_name IS NULL
-            THEN 'Unknown' ELSE r.concept_name
-        END AS race,
-        CASE
-            WHEN LOWER(e.concept_name) LIKE '%no matching concept%' OR e.concept_name IS NULL
-            THEN 'Unknown' ELSE e.concept_name
-        END AS ethnicity
+
+        -- Sex
+        CASE WHEN LOWER(g.concept_name) = 'male'                                     THEN 1 ELSE 0 END AS sex_male,
+        CASE WHEN LOWER(g.concept_name) = 'female'                                   THEN 1 ELSE 0 END AS sex_female,
+        CASE WHEN LOWER(g.concept_name) = 'no matching concept' OR g.concept_name IS NULL THEN 1 ELSE 0 END AS sex_unknown,
+
+        -- Race
+        CASE WHEN LOWER(r.concept_name) = 'white'                                    THEN 1 ELSE 0 END AS race_white,
+        CASE WHEN LOWER(r.concept_name) = 'black or african american'                THEN 1 ELSE 0 END AS race_black_or_african_american,
+        CASE WHEN LOWER(r.concept_name) = 'asian'                                    THEN 1 ELSE 0 END AS race_asian,
+        CASE WHEN LOWER(r.concept_name) = 'american indian or alaska native'         THEN 1 ELSE 0 END AS race_american_indian_or_alaska_native,
+        CASE WHEN LOWER(r.concept_name) = 'native hawaiian or other pacific islander' THEN 1 ELSE 0 END AS race_native_hawaiian_or_other_pacific_islander,
+        CASE WHEN LOWER(r.concept_name) = 'other race'                               THEN 1 ELSE 0 END AS race_other,
+        CASE WHEN LOWER(r.concept_name) = 'no matching concept' OR r.concept_name IS NULL THEN 1 ELSE 0 END AS race_unknown,
+
+        -- Ethnicity
+        CASE WHEN LOWER(e.concept_name) = 'not hispanic or latino'                   THEN 1 ELSE 0 END AS ethnicity_not_hispanic_or_latino,
+        CASE WHEN LOWER(e.concept_name) = 'hispanic or latino'                       THEN 1 ELSE 0 END AS ethnicity_hispanic_or_latino,
+        CASE WHEN LOWER(e.concept_name) = 'no matching concept' OR e.concept_name IS NULL THEN 1 ELSE 0 END AS ethnicity_unknown
+
     FROM person p
     JOIN EligibleCohort cd
         ON p.person_id = cd.person_id
@@ -243,15 +276,27 @@ Demographics AS (
 -- Final output: one row per patient per drug exposure record
 SELECT
     ec.person_id,
-    csa.first_score,
-    csa.last_score,
-    (csa.last_score - csa.first_score) AS score_delta,
-    csa.avg_followup_score,
-    d.age_at_index,
-    d.sex,
-    d.race,
-    d.ethnicity,
     ec.index_date,
+    csr.cutoff_score,
+    csr.measurement_date AS test_date,
+    csr.prev_test_date,
+    csr.prev_score,
+    csr.score_delta_from_last,
+    csr.trajectory,
+    d.age_at_index,
+    d.sex_male,
+    d.sex_female,
+    d.sex_unknown,
+    d.race_white,
+    d.race_black_or_african_american,
+    d.race_asian,
+    d.race_american_indian_or_alaska_native,
+    d.race_native_hawaiian_or_other_pacific_islander,
+    d.race_other,
+    d.race_unknown,
+    d.ethnicity_not_hispanic_or_latino,
+    d.ethnicity_hispanic_or_latino,
+    d.ethnicity_unknown,
 
     -- Haloperidol
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.cumulative_days_exposed END), 0) AS haloperidol_days,
@@ -322,20 +367,37 @@ SELECT
 FROM EligibleCohort ec
 JOIN Demographics d
     ON ec.person_id = d.person_id
+JOIN CogScoreWithDelta csr
+    ON ec.person_id = csr.person_id
 JOIN drug_cohort_collapsed dcc
     ON ec.person_id = dcc.person_id
+    AND dcc.test_date = csr.measurement_date
 LEFT JOIN drug_hierarchy dh
     ON dcc.drug_concept_id = dh.drug_concept_id
-INNER JOIN CogScoreAgg csa
-    ON ec.person_id = csa.person_id
 GROUP BY
     ec.person_id,
     ec.index_date,
     d.age_at_index,
-    d.sex,
-    d.race,
-    d.ethnicity,
-    csa.first_score,
-    csa.last_score,
-    csa.avg_followup_score
-ORDER BY ec.person_id
+    
+    d.sex_male,
+    d.sex_female,
+    d.sex_unknown,
+    d.race_white,
+    d.race_black_or_african_american,
+    d.race_asian,
+    d.race_american_indian_or_alaska_native,
+    d.race_native_hawaiian_or_other_pacific_islander,
+    d.race_other,
+    d.race_unknown,
+    d.ethnicity_not_hispanic_or_latino,
+    d.ethnicity_hispanic_or_latino,
+    d.ethnicity_unknown,
+    
+    csr.measurement_date,
+    csr.scale,
+    csr.cutoff_score,
+    csr.prev_test_date,
+    csr.prev_score,
+    csr.score_delta_from_last,
+    csr.trajectory
+ORDER BY ec.person_id, csr.measurement_date
