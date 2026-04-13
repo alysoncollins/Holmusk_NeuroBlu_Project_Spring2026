@@ -110,6 +110,7 @@ CognitiveScores AS (
     WHERE m.value_as_number IS NOT NULL
         AND m.measurement_date >= ec.index_date
         AND m.measurement_date <= DATEADD(DAY, 730, ec.index_date)
+        AND m.value_as_number <= 30
     GROUP BY
         m.person_id,
         m.measurement_date,
