@@ -3,6 +3,7 @@ from catboost import CatBoostClassifier
 from lightgbm import LGBMClassifier
 from sklearn.metrics import classification_report, accuracy_score
 from xgboost import XGBClassifier
+from sklearn.metrics import log_loss
 import pandas as pd
 import Graph
 
@@ -17,11 +18,15 @@ def get_feature_importance(model, feature_names):
 def randomforest_model(X_train, Y_train, X_test, Y_test, target_names, feature_names):
     rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
     rf_model.fit(X_train, Y_train)
+    
     rf_preds = rf_model.predict(X_test)
+    rf_probs = rf_model.predict_proba(X_test)
 
     print("\n--- Random Forest Classification Report ---")
     print(classification_report(Y_test, rf_preds, target_names=target_names))
     print(f"  Accuracy: {accuracy_score(Y_test, rf_preds):.4f}")
+
+    print(f"  Log Loss: {log_loss(Y_test, rf_probs):.4f}")
 
     rf_importance = get_feature_importance(rf_model, feature_names)
     print("\n--- Random Forest Feature Importance ---")
@@ -38,11 +43,15 @@ def catboost_model(X_train, Y_train, X_test, Y_test, target_names, feature_names
         verbose=0
     )
     cb_model.fit(X_train, Y_train)
+    
     cb_preds = cb_model.predict(X_test)
-
+    cb_probs = cb_model.predict_proba(X_test)
+    
     print("\n--- CatBoost Classification Report ---")
     print(classification_report(Y_test, cb_preds, target_names=target_names))
     print(f"  Accuracy: {accuracy_score(Y_test, cb_preds):.4f}")
+
+    print(f"  Log Loss: {log_loss(Y_test, cb_probs):.4f}")
 
     cb_importance = get_feature_importance(cb_model, feature_names)
     print("\n--- CatBoost Feature Importance ---")
@@ -60,11 +69,15 @@ def lightgbm_model(X_train, Y_train, X_test, Y_test, target_names, feature_names
         verbose=-1
     )
     lgbm_model.fit(X_train, Y_train)
+    
     lgbm_preds = lgbm_model.predict(X_test)
+    lgbm_probs = lgbm_model.predict_proba(X_test)
 
     print("\n--- LightGBM Classification Report ---")
     print(classification_report(Y_test, lgbm_preds, target_names=target_names))
     print(f"  Accuracy: {accuracy_score(Y_test, lgbm_preds):.4f}")
+
+    print(f"  Log Loss: {log_loss(Y_test, lgbm_probs):.4f}")
 
     lgbm_importance = get_feature_importance(lgbm_model, feature_names)
     print("\n--- LightGBM Feature Importance ---")
@@ -83,11 +96,15 @@ def xgboost_model(X_train, Y_train, X_test, Y_test, target_names, feature_names)
         verbosity=0
     )
     xgb_model.fit(X_train, Y_train)
+    
     xgb_preds = xgb_model.predict(X_test)
+    xgb_probs = xgb_model.predict_proba(X_test)
 
     print("\n--- XGBoost Classification Report ---")
     print(classification_report(Y_test, xgb_preds, target_names=target_names))
     print(f"  Accuracy: {accuracy_score(Y_test, xgb_preds):.4f}")
+
+    print(f"  Log Loss: {log_loss(Y_test, xgb_probs):.4f}")
 
     xgb_importance = get_feature_importance(xgb_model, feature_names)
     print("\n--- XGBoost Feature Importance ---")
