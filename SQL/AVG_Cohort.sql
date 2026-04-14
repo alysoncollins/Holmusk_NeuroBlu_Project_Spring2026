@@ -31,7 +31,7 @@ CohortDiagnosis AS (
     HAVING MIN(co.condition_start_date) IS NOT NULL
 ),
 
--- One observation period row per patient using the latest end date
+-- One observation period row per person using the latest end date
 ObsPeriod AS (
     SELECT
         person_id,
@@ -82,7 +82,7 @@ TestCutoffs AS (
     UNION ALL SELECT 'moca',   26.0,            30.0
 ),
 
--- Standardized cognitive scores for eligible patients only
+-- Standardized cognitive scores for eligible persons only
 CognitiveScores AS (
     SELECT
         m.person_id,
@@ -159,7 +159,7 @@ CogScoreWithDelta AS (
     WHERE prev_score IS NOT NULL
 ),
 
--- Drug exposure windows scoped to eligible patients only
+-- Drug exposure windows scoped to eligible persons only
 drug_cohort AS (
     SELECT
         de.person_id,
@@ -221,7 +221,7 @@ drug_hierarchy AS (
         OR cdim.ingredient_concept_name LIKE '%risperidone%'
 ),
 
--- Drug exposures collapsed to one row per patient per drug per ingredient
+-- Drug exposures collapsed to one row per person per drug per ingredient
 drug_cohort_collapsed AS (
     SELECT
         dc.person_id,
@@ -242,7 +242,7 @@ drug_cohort_collapsed AS (
         dh.ingredient_level
 ),
 
--- Patient demographics with unknown concepts labeled rather than excluded
+-- person demographics with unknown concepts labeled rather than excluded
 Demographics AS (
     SELECT
         p.person_id,
@@ -276,9 +276,423 @@ Demographics AS (
     LEFT JOIN concept g ON p.gender_concept_id = g.concept_id
     LEFT JOIN concept r ON p.race_concept_id = r.concept_id
     LEFT JOIN concept e ON p.ethnicity_concept_id = e.concept_id
+),
+
+-- Raw lab measurements for the target concept IDs, eligible persons only
+LabsCohort AS (
+    SELECT
+        m.person_id,
+        m.measurement_id,
+        m.measurement_concept_id,
+        m.measurement_datetime,
+        m.value_as_number,
+        ec.index_date
+    FROM measurement m
+    INNER JOIN EligibleCohort ec
+        ON m.person_id = ec.person_id
+    WHERE m.measurement_concept_id IN (
+        3003722, 3050174, 3043102, 42868556, 1469579,
+        1092155, 1259491, 3011498, 3029139, 3042151,
+        1761505, 1617650, 1616613, 3042810, 42868555, 1617024
+    )
+      AND m.value_as_number IS NOT NULL
+),
+
+-- Row-number + lag to identify most-recent value and its predecessor
+LabsRanked AS (
+    SELECT
+        person_id,
+        measurement_concept_id,
+        measurement_datetime,
+        value_as_number,
+        ROW_NUMBER() OVER (
+            PARTITION BY person_id, measurement_concept_id
+            ORDER BY measurement_datetime DESC, measurement_id DESC
+        ) AS rn,
+        LAG(value_as_number) OVER (
+            PARTITION BY person_id, measurement_concept_id
+            ORDER BY measurement_datetime ASC, measurement_id ASC
+        ) AS previous_score,
+        LAG(measurement_datetime) OVER (
+            PARTITION BY person_id, measurement_concept_id
+            ORDER BY measurement_datetime ASC, measurement_id ASC
+        ) AS previous_score_datetime
+    FROM LabsCohort
+),
+
+-- Most-recent row per person per concept
+LabsMostRecent AS (
+    SELECT
+        csr.person_id,
+        csr.measurement_date AS test_date,
+        lc.measurement_concept_id,
+        lc.value_as_number as most_recent_score,
+        lc.measurement_datetime,
+
+        -- previous lab BEFORE this test_date
+        LAG(lc.value_as_number) OVER (
+            PARTITION BY csr.person_id, lc.measurement_concept_id, csr.measurement_date
+            ORDER BY lc.measurement_datetime
+        ) AS previous_value
+
+    FROM CogScoreWithDelta csr
+    JOIN LabsCohort lc
+        ON lc.person_id = csr.person_id
+       AND lc.measurement_datetime <= csr.measurement_date
+),
+
+-- Rolling 90-day mean/median anchored to each person's most-recent measurement
+LabsRollingStats AS (
+    SELECT
+        csr.person_id,
+        csr.measurement_date AS test_date,
+        lc.measurement_concept_id,
+
+        AVG(lc.value_as_number) AS rolling_mean_90d,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lc.value_as_number) AS rolling_median_90d,
+        COUNT(*) AS n_labs_90d
+
+    FROM CogScoreWithDelta csr
+    JOIN LabsCohort lc
+        ON lc.person_id = csr.person_id
+       AND lc.measurement_datetime BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                      AND csr.measurement_date
+    GROUP BY csr.person_id, csr.measurement_date, lc.measurement_concept_id
+),
+
+-- Abnormal flag for the most-recent measurement against reference range
+LabsFlag AS (
+    SELECT
+        lp.person_id,
+        lp.test_date,
+        lp.measurement_concept_id,
+        CASE
+            WHEN lp.most_recent_score < m.range_low THEN 1
+            WHEN lp.most_recent_score > m.range_high THEN 1
+            ELSE 0
+        END AS abnormal_flag
+    FROM LabsMostRecent lp
+    LEFT JOIN measurement m
+        ON lp.person_id = m.person_id
+       AND lp.measurement_concept_id = m.measurement_concept_id
+       AND lp.measurement_datetime = m.measurement_datetime
+),
+
+-- Collapse all lab metrics to one wide row per person via conditional aggregation
+-- Each concept_id becomes a column group: most_recent, previous, mean_90d, median_90d, abnormal_flag
+-- Rename column aliases below if friendlier concept names are preferred over concept IDs
+LabsAggPerTest AS (
+    SELECT
+        mr.person_id,
+        mr.test_date,
+
+        -- Concept 3003722
+        MAX(CASE WHEN mr.measurement_concept_id = 3003722  THEN mr.most_recent_score   END) AS lab_3003722_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 3003722  THEN rs.rolling_mean_90d     END) AS lab_3003722_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3003722  THEN rs.rolling_median_90d   END) AS lab_3003722_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3003722  THEN lf.abnormal_flag        END) AS lab_3003722_abnormal_flag,
+
+        -- Concept 3050174
+        MAX(CASE WHEN mr.measurement_concept_id = 3050174  THEN mr.most_recent_score   END) AS lab_3050174_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 3050174  THEN rs.rolling_mean_90d     END) AS lab_3050174_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3050174  THEN rs.rolling_median_90d   END) AS lab_3050174_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3050174  THEN lf.abnormal_flag        END) AS lab_3050174_abnormal_flag,
+
+        -- Concept 3043102
+        MAX(CASE WHEN mr.measurement_concept_id = 3043102  THEN mr.most_recent_score   END) AS lab_3043102_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 3043102  THEN rs.rolling_mean_90d     END) AS lab_3043102_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3043102  THEN rs.rolling_median_90d   END) AS lab_3043102_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3043102  THEN lf.abnormal_flag        END) AS lab_3043102_abnormal_flag,
+
+        -- Concept 42868556
+        MAX(CASE WHEN mr.measurement_concept_id = 42868556 THEN mr.most_recent_score   END) AS lab_42868556_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 42868556 THEN rs.rolling_mean_90d     END) AS lab_42868556_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 42868556 THEN rs.rolling_median_90d   END) AS lab_42868556_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 42868556 THEN lf.abnormal_flag        END) AS lab_42868556_abnormal_flag,
+
+        -- Concept 1469579
+        MAX(CASE WHEN mr.measurement_concept_id = 1469579  THEN mr.most_recent_score   END) AS lab_1469579_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 1469579  THEN rs.rolling_mean_90d     END) AS lab_1469579_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1469579  THEN rs.rolling_median_90d   END) AS lab_1469579_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1469579  THEN lf.abnormal_flag        END) AS lab_1469579_abnormal_flag,
+
+        -- Concept 1092155
+        MAX(CASE WHEN mr.measurement_concept_id = 1092155  THEN mr.most_recent_score   END) AS lab_1092155_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 1092155  THEN rs.rolling_mean_90d     END) AS lab_1092155_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1092155  THEN rs.rolling_median_90d   END) AS lab_1092155_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1092155  THEN lf.abnormal_flag        END) AS lab_1092155_abnormal_flag,
+
+        -- Concept 1259491
+        MAX(CASE WHEN mr.measurement_concept_id = 1259491  THEN mr.most_recent_score   END) AS lab_1259491_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 1259491  THEN rs.rolling_mean_90d     END) AS lab_1259491_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1259491  THEN rs.rolling_median_90d   END) AS lab_1259491_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1259491  THEN lf.abnormal_flag        END) AS lab_1259491_abnormal_flag,
+
+        -- Concept 3011498
+        MAX(CASE WHEN mr.measurement_concept_id = 3011498  THEN mr.most_recent_score   END) AS lab_3011498_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 3011498  THEN rs.rolling_mean_90d     END) AS lab_3011498_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3011498  THEN rs.rolling_median_90d   END) AS lab_3011498_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3011498  THEN lf.abnormal_flag        END) AS lab_3011498_abnormal_flag,
+
+        -- Concept 3029139
+        MAX(CASE WHEN mr.measurement_concept_id = 3029139  THEN mr.most_recent_score   END) AS lab_3029139_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 3029139  THEN rs.rolling_mean_90d     END) AS lab_3029139_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3029139  THEN rs.rolling_median_90d   END) AS lab_3029139_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3029139  THEN lf.abnormal_flag        END) AS lab_3029139_abnormal_flag,
+
+        -- Concept 3042151
+        MAX(CASE WHEN mr.measurement_concept_id = 3042151  THEN mr.most_recent_score   END) AS lab_3042151_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 3042151  THEN rs.rolling_mean_90d     END) AS lab_3042151_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3042151  THEN rs.rolling_median_90d   END) AS lab_3042151_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3042151  THEN lf.abnormal_flag        END) AS lab_3042151_abnormal_flag,
+
+        -- Concept 1761505
+        MAX(CASE WHEN mr.measurement_concept_id = 1761505  THEN mr.most_recent_score   END) AS lab_1761505_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 1761505  THEN rs.rolling_mean_90d     END) AS lab_1761505_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1761505  THEN rs.rolling_median_90d   END) AS lab_1761505_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1761505  THEN lf.abnormal_flag        END) AS lab_1761505_abnormal_flag,
+
+        -- Concept 1617650
+        MAX(CASE WHEN mr.measurement_concept_id = 1617650  THEN mr.most_recent_score   END) AS lab_1617650_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 1617650  THEN rs.rolling_mean_90d     END) AS lab_1617650_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1617650  THEN rs.rolling_median_90d   END) AS lab_1617650_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1617650  THEN lf.abnormal_flag        END) AS lab_1617650_abnormal_flag,
+
+        -- Concept 1616613
+        MAX(CASE WHEN mr.measurement_concept_id = 1616613  THEN mr.most_recent_score   END) AS lab_1616613_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 1616613  THEN rs.rolling_mean_90d     END) AS lab_1616613_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1616613  THEN rs.rolling_median_90d   END) AS lab_1616613_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1616613  THEN lf.abnormal_flag        END) AS lab_1616613_abnormal_flag,
+
+        -- Concept 3042810
+        MAX(CASE WHEN mr.measurement_concept_id = 3042810  THEN mr.most_recent_score   END) AS lab_3042810_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 3042810  THEN rs.rolling_mean_90d     END) AS lab_3042810_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3042810  THEN rs.rolling_median_90d   END) AS lab_3042810_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 3042810  THEN lf.abnormal_flag        END) AS lab_3042810_abnormal_flag,
+
+        -- Concept 42868555
+        MAX(CASE WHEN mr.measurement_concept_id = 42868555 THEN mr.most_recent_score   END) AS lab_42868555_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 42868555 THEN rs.rolling_mean_90d     END) AS lab_42868555_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 42868555 THEN rs.rolling_median_90d   END) AS lab_42868555_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 42868555 THEN lf.abnormal_flag        END) AS lab_42868555_abnormal_flag,
+
+        -- Concept 1617024
+        MAX(CASE WHEN mr.measurement_concept_id = 1617024  THEN mr.most_recent_score   END) AS lab_1617024_most_recent,
+        MAX(CASE WHEN mr.measurement_concept_id = 1617024  THEN rs.rolling_mean_90d     END) AS lab_1617024_mean_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1617024  THEN rs.rolling_median_90d   END) AS lab_1617024_median_90d,
+        MAX(CASE WHEN mr.measurement_concept_id = 1617024  THEN lf.abnormal_flag        END) AS lab_1617024_abnormal_flag
+
+    FROM LabsMostRecent mr
+    LEFT JOIN LabsRollingStats rs
+        ON  mr.person_id              = rs.person_id
+        AND mr.measurement_concept_id = rs.measurement_concept_id
+        AND mr.test_date = rs.test_date
+    LEFT JOIN LabsFlag lf
+        ON  mr.person_id              = lf.person_id
+        AND mr.measurement_concept_id = lf.measurement_concept_id
+        AND mr.test_date = lf.test_date
+    GROUP BY mr.person_id, mr.test_date
+),
+procedures AS (
+    SELECT person_id, procedure_concept_id, procedure_date
+    FROM procedure_occurrence
+    WHERE procedure_concept_id IN (
+        '2211329', '2211328', '2211327', '2211332', '2211330',
+        '2211353','2211351','2211719','2212018','2212056','2212053'
+    )
+),
+
+labs AS (
+    SELECT
+        person_id,
+        MAX(measurement_date) AS most_recent_measurement
+    FROM measurement
+    WHERE measurement_concept_id IN (
+        '3003722','3050174','3043102','42868556','1469579',
+        '1092155','1259491','3011498','3029139','3042151',
+        '1761505','1617650','1616613','3042810','42868555','1617024'
+    )
+    GROUP BY person_id
+),
+
+ProceduresPerTest AS (
+    SELECT
+        csr.person_id,
+        csr.measurement_date AS test_date,
+        p.procedure_concept_id,
+
+        -- CONCEPT: 2211329 computed tomography, head or brain; without contrast material, followed by contrast material(s) and further sections
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2211329'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2211329,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2211329'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2211329,
+
+        -- CONCEPT: 2211328 computed tomography, head or brain; with contrast material(s)
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2211328'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2211328,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2211328'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2211328,
+
+        -- CONCEPT: 2211327 computed tomography, head or brain; without contrast material
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2211327'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2211327,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2211327'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2211327,
+
+        -- CONCEPT: 2211332 computed tomography, orbit, sella, or posterior fossa or outer, middle, or inner ear; without contrast material, followed by contrast material(s) and further sections  
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2211332'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2211332,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2211332'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2211332,
+
+        -- CONCEPT: 2211330 computed tomography, orbit, sella, or posterior fossa or outer, middle, or inner ear; without contrast material
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2211330'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2211330,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2211330'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2211330,
+
+        -- CONCEPT: 2211353 magnetic resonance (eg, proton) imaging, brain (including brain stem); without contrast material, followed by contrast material(s) and further sequences 
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2211353'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2211353,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2211353'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2211353,
+
+        -- CONCEPT: 2211351 magnetic resonance (eg, proton) imaging, brain (including brain stem); without contrast material  
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2211351'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2211351,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2211351'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2211351,
+
+        -- CONCEPT: 2211719 magnetic resonance spectroscopy 
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2211719'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2211719,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2211719'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2211719,
+
+        -- CONCEPT: 2212018 brain imaging, positron emission tomography (pet); metabolic evaluation   
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2212018'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2212018,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2212018'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2212018,
+
+        -- CONCEPT: 2212056 positron emission tomography (pet) with concurrently acquired computed tomography (ct) for attenuation correction and anatomical localization imaging; limited area (eg, chest, head/neck)    
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2212056'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2212056,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2212056'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2212056,
+
+        -- CONCEPT: 2212053 positron emission tomography (pet) imaging; limited area (eg, chest, head/neck)
+        COUNT(DISTINCT CASE
+            WHEN p.procedure_concept_id = '2212053'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN p.procedure_date
+        END) AS procedure_count_180d_2212053,
+
+        MAX(CASE
+            WHEN p.procedure_concept_id = '2212053'
+             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+                                  AND csr.measurement_date
+            THEN 1 ELSE 0
+        END) AS procedure_within_90d_2212053
+
+    FROM CogScoreWithDelta csr
+    LEFT JOIN procedure_occurrence p
+        ON p.person_id = csr.person_id
+    GROUP BY csr.person_id, csr.measurement_date, p.procedure_concept_id
 )
 
--- Final output: one row per patient per drug exposure record
+-- Final output: one row per person per drug exposure record
 SELECT
     ec.person_id,
     ec.index_date,
@@ -367,13 +781,62 @@ SELECT
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.cumulative_days_exposed END), 0) AS risperidone_days,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_0_30d END), 0)           AS risperidone_0_30d,
     COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_31_90d END), 0)          AS risperidone_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_91_180d END), 0)         AS risperidone_91_180d
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_91_180d END), 0)         AS risperidone_91_180d,
 
-FROM EligibleCohort ec
+    -- ==========================================================
+    -- 3. LAB METRICS (Most Recent, Mean 90d, Median 90d, Flag)
+    -- ==========================================================
+    -- IDs: 3003722, 3050174, 3043102, 42868556, 1469579
+    COALESCE(la.lab_3003722_most_recent, 0) AS lab_3003722_recent, COALESCE(la.lab_3003722_mean_90d, 0) AS lab_3003722_mean, COALESCE(la.lab_3003722_median_90d, 0) AS lab_3003722_median, COALESCE(la.lab_3003722_abnormal_flag, 0) AS lab_3003722_abn,
+    COALESCE(la.lab_3050174_most_recent, 0) AS lab_3050174_recent, COALESCE(la.lab_3050174_mean_90d, 0) AS lab_3050174_mean, COALESCE(la.lab_3050174_median_90d, 0) AS lab_3050174_median, COALESCE(la.lab_3050174_abnormal_flag, 0) AS lab_3050174_abn,
+    COALESCE(la.lab_3043102_most_recent, 0) AS lab_3043102_recent, COALESCE(la.lab_3043102_mean_90d, 0) AS lab_3043102_mean, COALESCE(la.lab_3043102_median_90d, 0) AS lab_3043102_median, COALESCE(la.lab_3043102_abnormal_flag, 0) AS lab_3043102_abn,
+    COALESCE(la.lab_42868556_most_recent, 0) AS lab_42868556_recent, COALESCE(la.lab_42868556_mean_90d, 0) AS lab_42868556_mean, COALESCE(la.lab_42868556_median_90d, 0) AS lab_42868556_median, COALESCE(la.lab_42868556_abnormal_flag, 0) AS lab_42868556_abn,
+    COALESCE(la.lab_1469579_most_recent, 0) AS lab_1469579_recent, COALESCE(la.lab_1469579_mean_90d, 0) AS lab_1469579_mean, COALESCE(la.lab_1469579_median_90d, 0) AS lab_1469579_median, COALESCE(la.lab_1469579_abnormal_flag, 0) AS lab_1469579_abn,
+
+    -- IDs: 1092155, 1259491, 3011498, 3029139, 3042151
+    COALESCE(la.lab_1092155_most_recent, 0) AS lab_1092155_recent, COALESCE(la.lab_1092155_mean_90d, 0) AS lab_1092155_mean, COALESCE(la.lab_1092155_median_90d, 0) AS lab_1092155_median, COALESCE(la.lab_1092155_abnormal_flag, 0) AS lab_1092155_abn,
+    COALESCE(la.lab_1259491_most_recent, 0) AS lab_1259491_recent, COALESCE(la.lab_1259491_mean_90d, 0) AS lab_1259491_mean, COALESCE(la.lab_1259491_median_90d, 0) AS lab_1259491_median, COALESCE(la.lab_1259491_abnormal_flag, 0) AS lab_1259491_abn,
+    COALESCE(la.lab_3011498_most_recent, 0) AS lab_3011498_recent, COALESCE(la.lab_3011498_mean_90d, 0) AS lab_3011498_mean, COALESCE(la.lab_3011498_median_90d, 0) AS lab_3011498_median, COALESCE(la.lab_3011498_abnormal_flag, 0) AS lab_3011498_abn,
+    COALESCE(la.lab_3029139_most_recent, 0) AS lab_3029139_recent, COALESCE(la.lab_3029139_mean_90d, 0) AS lab_3029139_mean, COALESCE(la.lab_3029139_median_90d, 0) AS lab_3029139_median, COALESCE(la.lab_3029139_abnormal_flag, 0) AS lab_3029139_abn,
+    COALESCE(la.lab_3042151_most_recent, 0) AS lab_3042151_recent, COALESCE(la.lab_3042151_mean_90d, 0) AS lab_3042151_mean, COALESCE(la.lab_3042151_median_90d, 0) AS lab_3042151_median, COALESCE(la.lab_3042151_abnormal_flag, 0) AS lab_3042151_abn,
+
+    -- IDs: 1761505, 1617650, 1616613, 3042810, 42868555, 1617024
+    COALESCE(la.lab_1761505_most_recent, 0) AS lab_1761505_recent, COALESCE(la.lab_1761505_mean_90d, 0) AS lab_1761505_mean, COALESCE(la.lab_1761505_median_90d, 0) AS lab_1761505_median, COALESCE(la.lab_1761505_abnormal_flag, 0) AS lab_1761505_abn,
+    COALESCE(la.lab_1617650_most_recent, 0) AS lab_1617650_recent, COALESCE(la.lab_1617650_mean_90d, 0) AS lab_1617650_mean, COALESCE(la.lab_1617650_median_90d, 0) AS lab_1617650_median, COALESCE(la.lab_1617650_abnormal_flag, 0) AS lab_1617650_abn,
+    COALESCE(la.lab_1616613_most_recent, 0) AS lab_1616613_recent, COALESCE(la.lab_1616613_mean_90d, 0) AS lab_1616613_mean, COALESCE(la.lab_1616613_median_90d, 0) AS lab_1616613_median, COALESCE(la.lab_1616613_abnormal_flag, 0) AS lab_1616613_abn,
+    COALESCE(la.lab_3042810_most_recent, 0) AS lab_3042810_recent, COALESCE(la.lab_3042810_mean_90d, 0) AS lab_3042810_mean, COALESCE(la.lab_3042810_median_90d, 0) AS lab_3042810_median, COALESCE(la.lab_3042810_abnormal_flag, 0) AS lab_3042810_abn,
+    COALESCE(la.lab_42868555_most_recent, 0) AS lab_42868555_recent, COALESCE(la.lab_42868555_mean_90d, 0) AS lab_42868555_mean, COALESCE(la.lab_42868555_median_90d, 0) AS lab_42868555_median, COALESCE(la.lab_42868555_abnormal_flag, 0) AS lab_42868555_abn,
+    COALESCE(la.lab_1617024_most_recent, 0) AS lab_1617024_recent, COALESCE(la.lab_1617024_mean_90d, 0) AS lab_1617024_mean, COALESCE(la.lab_1617024_median_90d, 0) AS lab_1617024_median, COALESCE(la.lab_1617024_abnormal_flag, 0) AS lab_1617024_abn,
+
+    -- ==========================================================
+    -- 4. PROCEDURE METRICS (180d Count & 90d Presence Flag)
+    -- ==========================================================
+    -- IDs: 2211329, 2211328, 2211327, 2211332, 2211330
+    COALESCE(pr.procedure_count_180d_2211329, 0) AS pr_2211329_ct, COALESCE(pr.procedure_within_90d_2211329, 0) AS pr_2211329_90d,
+    COALESCE(pr.procedure_count_180d_2211328, 0) AS pr_2211328_ct, COALESCE(pr.procedure_within_90d_2211328, 0) AS pr_2211328_90d,
+    COALESCE(pr.procedure_count_180d_2211327, 0) AS pr_2211327_ct, COALESCE(pr.procedure_within_90d_2211327, 0) AS pr_2211327_90d,
+    COALESCE(pr.procedure_count_180d_2211332, 0) AS pr_2211332_ct, COALESCE(pr.procedure_within_90d_2211332, 0) AS pr_2211332_90d,
+    COALESCE(pr.procedure_count_180d_2211330, 0) AS pr_2211330_ct, COALESCE(pr.procedure_within_90d_2211330, 0) AS pr_2211330_90d,
+
+    -- IDs: 2211353, 2211351, 2211719, 2212018, 2212056, 2212053
+    COALESCE(pr.procedure_count_180d_2211353, 0) AS pr_2211353_ct, COALESCE(pr.procedure_within_90d_2211353, 0) AS pr_2211353_90d,
+    COALESCE(pr.procedure_count_180d_2211351, 0) AS pr_2211351_ct, COALESCE(pr.procedure_within_90d_2211351, 0) AS pr_2211351_90d,
+    COALESCE(pr.procedure_count_180d_2211719, 0) AS pr_2211719_ct, COALESCE(pr.procedure_within_90d_2211719, 0) AS pr_2211719_90d,
+    COALESCE(pr.procedure_count_180d_2212018, 0) AS pr_2212018_ct, COALESCE(pr.procedure_within_90d_2212018, 0) AS pr_2212018_90d,
+    COALESCE(pr.procedure_count_180d_2212056, 0) AS pr_2212056_ct, COALESCE(pr.procedure_within_90d_2212056, 0) AS pr_2212056_90d,
+    COALESCE(pr.procedure_count_180d_2212053, 0) AS pr_2212053_ct, COALESCE(pr.procedure_within_90d_2212053, 0) AS pr_2212053_90d
+    
+FROM CogScoreWithDelta csr
+LEFT JOIN EligibleCohort ec 
+    on csr.person_id = ec.person_id
+LEFT JOIN LabsAggPerTest la
+    ON csr.person_id = la.person_id 
+    AND csr.measurement_date = la.test_date
+LEFT JOIN ProceduresPerTest pr
+    ON csr.person_id = pr.person_id
+    AND csr.measurement_date = pr.test_date
 JOIN Demographics d
     ON ec.person_id = d.person_id
-JOIN CogScoreWithDelta csr
-    ON ec.person_id = csr.person_id
 JOIN drug_cohort_collapsed dcc
     ON ec.person_id = dcc.person_id
     AND dcc.test_date = csr.measurement_date
@@ -404,5 +867,36 @@ GROUP BY
     csr.prev_test_date,
     csr.prev_score,
     csr.score_delta_from_last,
-    csr.trajectory
+    csr.trajectory,
+
+    -- please god please work
+
+    lab_3003722_recent, lab_3003722_mean, lab_3003722_median, lab_3003722_abn,
+    lab_3050174_recent, lab_3050174_mean, lab_3050174_median, lab_3050174_abn,
+    lab_3043102_recent, lab_3043102_mean, lab_3043102_median, lab_3043102_abn,
+    lab_42868556_recent, lab_42868556_mean, lab_42868556_median, lab_42868556_abn,
+    lab_1469579_recent, lab_1469579_mean, lab_1469579_median, lab_1469579_abn,
+    lab_1092155_recent, lab_1092155_mean, lab_1092155_median, lab_1092155_abn,
+    lab_1259491_recent, lab_1259491_mean, lab_1259491_median, lab_1259491_abn,
+    lab_3011498_recent, lab_3011498_mean, lab_3011498_median, lab_3011498_abn,
+    lab_3029139_recent, lab_3029139_mean, lab_3029139_median, lab_3029139_abn,
+    lab_3042151_recent, lab_3042151_mean, lab_3042151_median, lab_3042151_abn,
+    lab_1761505_recent, lab_1761505_mean, lab_1761505_median, lab_1761505_abn,
+    lab_1617650_recent, lab_1617650_mean, lab_1617650_median, lab_1617650_abn,
+    lab_1616613_recent, lab_1616613_mean,  lab_1616613_median, lab_1616613_abn,
+    lab_3042810_recent, lab_3042810_mean, lab_3042810_median, lab_3042810_abn,
+    lab_42868555_recent, lab_42868555_mean, lab_42868555_median, lab_42868555_abn,
+    lab_1617024_recent, lab_1617024_mean, lab_1617024_median, lab_1617024_abn,
+
+    pr_2211329_ct, pr_2211329_90d,
+    pr_2211328_ct, pr_2211328_90d,
+    pr_2211327_ct, pr_2211327_90d,
+    pr_2211332_ct, pr_2211332_90d,
+    pr_2211330_ct, pr_2211330_90d,
+    pr_2211353_ct, pr_2211353_90d,
+    pr_2211351_ct, pr_2211351_90d,
+    pr_2211719_ct, pr_2211719_90d,
+    pr_2212018_ct, pr_2212018_90d,
+    pr_2212056_ct, pr_2212056_90d,
+    pr_2212053_ct, pr_2212053_90d
 ORDER BY ec.person_id, csr.measurement_date
