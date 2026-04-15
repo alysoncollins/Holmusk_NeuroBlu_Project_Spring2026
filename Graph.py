@@ -15,6 +15,9 @@ np.int = int
 
 
 def shap_plots(model, X_test, feature_names, target_names, model_name):
+    #this block is here to stop it from graphing just so testing is easier
+    print("graphing has been temporarily disabled to make testing a little easier")
+    return
     X_test_array = X_test.values if hasattr(X_test, 'values') else X_test
     feature_names = np.array(feature_names)
     
@@ -33,10 +36,13 @@ def shap_plots(model, X_test, feature_names, target_names, model_name):
     elif shap_values.ndim == 2:
         shap_values = shap_values[:, :, np.newaxis]
     
+    n_outputs = shap_values.shape[2]
+
     for i, target in enumerate(target_names):
-        print(f"Processing target: {target}")
-    
-        sv = shap_values[:, :, i]
+        # Binary classification: CatBoost returns shape (n_samples, n_features, 1)
+        # Both classes share the same SHAP values (positive class)
+        idx = min(i, n_outputs - 1)
+        sv = shap_values[:, :, idx]
     
         mean_abs_shap = np.abs(sv).mean(axis=0)
         top_idx = np.argsort(mean_abs_shap)[-10:]

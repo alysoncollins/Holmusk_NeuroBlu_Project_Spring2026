@@ -151,14 +151,12 @@ CogScoreWithDelta AS (
         prev_score,
         prev_test_date,
         cutoff_score - prev_score AS score_delta_from_last,
-        CASE
-            WHEN prev_score IS NULL          THEN 'BASELINE'
-            WHEN cutoff_score > prev_score   THEN 'IMPROVED'
-            WHEN cutoff_score < prev_score   THEN 'WORSE'
-            ELSE                                  'STABLE'
+        CASE  
+            WHEN cutoff_score >= 0 THEN 'IMPROVED'
+            ELSE 'WORSE'
         END AS trajectory
     FROM CogScoreRanked
-    WHERE prev_score IS NOT NULL
+    --WHERE prev_score IS NOT NULL
 ),
 
 -- Drug exposure windows scoped to eligible persons only
@@ -349,14 +347,16 @@ LabsRollingStats AS (
         csr.person_id,
         csr.measurement_date AS test_date,
         lc.measurement_concept_id,
+
         AVG(lc.value_as_number) AS rolling_mean_90d,
         PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY lc.value_as_number) AS rolling_median_90d,
         COUNT(*) AS n_labs_90d
+
     FROM CogScoreWithDelta csr
     JOIN LabsCohort lc
         ON lc.person_id = csr.person_id
        AND lc.measurement_datetime BETWEEN csr.measurement_date - INTERVAL 90 DAY
-                                       AND csr.measurement_date
+                                      AND csr.measurement_date
     GROUP BY csr.person_id, csr.measurement_date, lc.measurement_concept_id
 ),
 
