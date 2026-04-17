@@ -72,7 +72,7 @@ CognitiveScores AS (
     JOIN CohortDiagnosis cd
     ON m.person_id = cd.person_id
     WHERE ml.scale IN ('minicog', 'moca', 'mmse')
-    --AND m.value_as_number IS NOT NULL We should handle this by using the measurement_lookup values
+    --AND m.value_as_number IS NOT NULL  -- We should handle this case by using the measurement_lookup values
     AND m.measurement_date >= cd.index_date -- Ensures a cognitive assessment occurs after cohort entry
 ),
  
