@@ -16,20 +16,35 @@ WITH DrugsUsed AS (
         OR brand_name LIKE '%namenda%'
         OR brand_name LIKE '%belsomra%'
         OR brand_name LIKE '%risperdal%'
+    UNION ALL --- USING THE GENERIC NAME OF THE DRUGS
+    SELECT DISTINCT drug_concept_id
+    FROM drug_lookup
+    WHERE drug_concept_name LIKE '%lecanemab%'
+    OR drug_concept_name LIKE '%donanemab%'
+    OR drug_concept_name LIKE '%brexpiprazole%'
+    OR drug_concept_name LIKE '%memantine%'
+    OR drug_concept_name LIKE '%donepezil%'
+    OR drug_concept_name LIKE '%rivastigmina%'
+    OR drug_concept_name LIKE '%galantamine%'
+    OR drug_concept_name LIKE '%benzgalantamine%'
+    OR drug_concept_name LIKE '%suvorexant%'
+    OR drug_concept_name LIKE '%risperidone%'
 ),
  
 -- First diagnosis date of MCI OR Dementia OR Alzheimer's disease
 CohortDiagnosis AS (
     SELECT
         co.person_id,
-        MIN(co.condition_start_date) AS index_date, -- MIN is used to define the index date as the first diagnosis of MCI, Dementia, or Alzheimer's disease
+        MIN(co.condition_start_date) AS index_date,
+        -- MIN is used to define the index date as the first diagnosis of MCI, Dementia, or Alzheimer's disease
         MAX(d.icd_name) AS diagnosis_type -- MAX is used to retain a readable diagnosis label
     FROM condition_occurrence co
     JOIN diagnosis_lookup d
     ON co.condition_concept_id = d.icd_concept_id
-    WHERE d.icd_name LIKE '%mild cognitive% impairment%' -- OR is used since it can be any of the three
-       OR d.icd_name LIKE '%dementia%'
-       OR d.icd_name LIKE '%alzheimer%'
+    WHERE disorder_group = 'dementia'
+    OR array_contains(keywords, 'mci')
+    OR array_contains(keywords, 'ad')
+    
     GROUP BY co.person_id
 ),
  
@@ -53,13 +68,13 @@ CognitiveScores AS (
         m.value_as_number
     FROM measurement m
     JOIN measurement_lookup ml
-    ON m.custom2_str = ml.custom2_str
+    ON m.measurement_concept_id = ml.measurement_concept_id
     JOIN CohortDiagnosis cd
     ON m.person_id = cd.person_id
     WHERE ml.scale IN ('minicog', 'moca', 'mmse')
-    AND m.value_as_number IS NOT NULL
+    --AND m.value_as_number IS NOT NULL We should handle this by using the measurement_lookup values
     AND m.measurement_date >= cd.index_date -- Ensures a cognitive assessment occurs after cohort entry
-)
+),
  
 -- Final Cohort
 SELECT
