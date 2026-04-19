@@ -79,6 +79,7 @@ def main():
     print(f"Label encoding: {dict(zip(le.classes_, le.transform(le.classes_)))}")
 
     print(feature_names)
+    print("Rows and Columns after preprocessing")
     print(X_train.shape)
     
     train_groups = dataframe.iloc[train_idx]['person_id'].values
