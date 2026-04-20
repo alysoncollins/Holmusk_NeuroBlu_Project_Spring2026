@@ -1,6 +1,6 @@
 -- Identify target drug concept IDs (brand-name based)
 WITH DrugsUsed AS (
-    SELECT DISTINCT drug_concept_id
+SELECT DISTINCT drug_concept_id
     FROM drug_product_lookup
     WHERE brand_name LIKE '%leqembi%'
         OR brand_name LIKE '%kisunla%'
@@ -13,6 +13,21 @@ WITH DrugsUsed AS (
         OR brand_name LIKE '%namenda%'
         OR brand_name LIKE '%belsomra%'
         OR brand_name LIKE '%risperdal%'
+        
+     UNION ALL --- USING THE GENERIC NAME OF THE DRUGS
+    SELECT DISTINCT drug_concept_id
+    FROM drug_lookup
+    WHERE drug_concept_name LIKE '%lecanemab%'
+    OR drug_concept_name LIKE '%donanemab%'
+    OR drug_concept_name LIKE '%brexpiprazole%'
+    OR drug_concept_name LIKE '%memantine%'
+    OR drug_concept_name LIKE '%donepezil%'
+    OR drug_concept_name LIKE '%rivastigmina%'
+    OR drug_concept_name LIKE '%galantamine%'
+    OR drug_concept_name LIKE '%benzgalantamine%'
+    OR drug_concept_name LIKE '%suvorexant%'
+    OR drug_concept_name LIKE '%risperidone%'
+        
 ),
 
 -- First diagnosis date of MCI OR Dementia OR Alzheimer's
@@ -20,13 +35,13 @@ CohortDiagnosis AS (
     SELECT
         co.person_id,
         MIN(co.condition_start_date) AS index_date,
-        MAX(c.concept_name)          AS diagnosis_type
+        MAX(c.icd_name)          AS diagnosis_type
     FROM condition_occurrence co
-    JOIN concept c
-        ON co.condition_concept_id = c.concept_id
-    WHERE c.concept_name LIKE '%mild cognitive% impairment%'
-       OR c.concept_name LIKE '%dementia%'
-       OR c.concept_name LIKE '%alzheimer%'
+    JOIN diagnosis_lookup c
+        ON co.condition_concept_id = c.icd_concept_id
+    WHERE disorder_group = 'dementia'
+        OR array_contains(keywords, 'mci')
+        OR array_contains(keywords, 'ad')
     GROUP BY co.person_id
     HAVING MIN(co.condition_start_date) IS NOT NULL
 ),
@@ -35,9 +50,9 @@ CohortDiagnosis AS (
 ObsPeriod AS (
     SELECT
         person_id,
-        MAX(observation_period_end_date) AS observation_period_end_date
-    FROM observation_period
-    WHERE observation_period_end_date IS NOT NULL
+        MAX(visit_end_datetime) AS observation_period_end_date
+    FROM visit_occurrence
+    WHERE visit_end_datetime IS NOT NULL
     GROUP BY person_id
 ),
 
@@ -51,7 +66,8 @@ EligibleCohort AS (
     FROM CohortDiagnosis cd
     JOIN ObsPeriod op
         ON cd.person_id = op.person_id
-    WHERE DATEDIFF(DAY, cd.index_date, op.observation_period_end_date) >= 180
+    WHERE CAST(CAST(op.observation_period_end_date AS DATE) 
+           - CAST(cd.index_date AS DATE) AS INT) >= 180
       AND EXISTS (
           SELECT 1
           FROM drug_exposure de
@@ -90,39 +106,52 @@ CognitiveScores AS (
         ml.scale,
         AVG(
             CASE
-                WHEN m.value_as_number = tc.cutoff THEN 0
-                WHEN m.value_as_number < tc.cutoff THEN -(tc.cutoff - m.value_as_number) / tc.cutoff
-                WHEN m.value_as_number > tc.cutoff THEN  (m.value_as_number - tc.cutoff) / (tc.upper_bound - tc.cutoff)
+                WHEN COALESCE(m.value_as_number, 0) = tc.cutoff THEN 0
+                WHEN COALESCE(m.value_as_number, 0) < tc.cutoff THEN -(tc.cutoff - COALESCE(m.value_as_number, 0)) / tc.cutoff
+                WHEN COALESCE(m.value_as_number, 0) > tc.cutoff THEN  (COALESCE(m.value_as_number, 0) - tc.cutoff) / (tc.upper_bound - tc.cutoff)
                 ELSE NULL
             END
         ) AS cutoff_score
     FROM measurement m
     JOIN (
-        SELECT custom2_str, scale
+        SELECT measurement_concept_id, custom2_str, scale, scale_item
         FROM measurement_lookup
         WHERE scale IN ('minicog', 'moca', 'mmse')
           AND custom2_str IS NOT NULL
-    ) ml ON m.custom2_str = ml.custom2_str
+    ) ml ON m.measurement_concept_id = ml.measurement_concept_id
     JOIN TestCutoffs tc
         ON ml.scale = tc.scale
     JOIN EligibleCohort ec
         ON m.person_id = ec.person_id
-    WHERE m.value_as_number IS NOT NULL
+    WHERE
+        -- Keep rows where value is not null OR where it's a total score row (scale_item = 0)
+        (m.value_as_number IS NOT NULL OR ml.scale_item = 0)
         AND m.measurement_date >= ec.index_date
-        AND m.measurement_date <= DATEADD(DAY, 730, ec.index_date)
-        AND m.value_as_number <= 30
+        AND m.measurement_date <= ec.index_date + INTERVAL 365 DAY
+        AND COALESCE(m.value_as_number, 0) <= 30
     GROUP BY
         m.person_id,
         m.measurement_date,
         ml.scale
 ),
 
--- rank cognitive scores
+-- Average standardized scores across scales on the same day
+CogScoresAveragedByDay AS (
+    SELECT
+        person_id,
+        measurement_date,
+        AVG(cutoff_score) AS cutoff_score
+    FROM CognitiveScores
+    GROUP BY
+        person_id,
+        measurement_date
+),
+
+-- Rank cognitive scores
 CogScoreRanked AS (
     SELECT
         person_id,
         measurement_date,
-        scale,
         cutoff_score,
         ROW_NUMBER() OVER (
             PARTITION BY person_id
@@ -136,27 +165,23 @@ CogScoreRanked AS (
             PARTITION BY person_id
             ORDER BY measurement_date ASC NULLS LAST
         ) AS prev_test_date
-    FROM CognitiveScores
+    FROM CogScoresAveragedByDay
 ),
 
 CogScoreWithDelta AS (
     SELECT
         person_id,
         measurement_date,
-        scale,
         cutoff_score,
         test_sequence_number,
         prev_score,
         prev_test_date,
         cutoff_score - prev_score AS score_delta_from_last,
-        CASE
-            WHEN prev_score IS NULL          THEN 'BASELINE'
-            WHEN cutoff_score > prev_score   THEN 'IMPROVED'
-            WHEN cutoff_score < prev_score   THEN 'WORSE'
-            ELSE                                  'STABLE'
+        CASE  
+            WHEN cutoff_score >= 0 THEN 'IMPROVED'
+            ELSE 'WORSE'
         END AS trajectory
     FROM CogScoreRanked
-    WHERE prev_score IS NOT NULL
 ),
 
 -- Drug exposure windows scoped to eligible persons only
@@ -166,26 +191,24 @@ drug_cohort AS (
         de.drug_concept_id,
         ec.index_date,
         csr.measurement_date AS test_date,
-        (DATEDIFF(DAY,
-            de.drug_exposure_start_date,
-            COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
-        ) + 1) AS cumulative_days_exposed,
-        CASE
+        (CAST(CAST(COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date) AS DATE)
+     - CAST(de.drug_exposure_start_date AS DATE) AS INT) + 1) AS cumulative_days_exposed,
+CASE
             WHEN de.drug_exposure_start_date <= csr.measurement_date
              AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
-                 >= DATEADD(DAY, -30, csr.measurement_date)
+                 >= csr.measurement_date - INTERVAL 30 DAY
             THEN 1 ELSE 0
         END AS exposed_0_30d,
         CASE
-            WHEN de.drug_exposure_start_date <= DATEADD(DAY, -31, csr.measurement_date)
+            WHEN de.drug_exposure_start_date <= csr.measurement_date - INTERVAL 31 DAY
              AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
-                 >= DATEADD(DAY, -90, csr.measurement_date)
+                 >= csr.measurement_date - INTERVAL 90 DAY
             THEN 1 ELSE 0
         END AS exposed_31_90d,
         CASE
-            WHEN de.drug_exposure_start_date <= DATEADD(DAY, -91, csr.measurement_date)
+            WHEN de.drug_exposure_start_date <= csr.measurement_date - INTERVAL 91 DAY
              AND COALESCE(de.drug_exposure_end_date, de.drug_exposure_start_date)
-                 >= DATEADD(DAY, -180, csr.measurement_date)
+                 >= csr.measurement_date - INTERVAL 180 DAY
             THEN 1 ELSE 0
         END AS exposed_91_180d
     FROM drug_exposure de
@@ -242,9 +265,84 @@ drug_cohort_collapsed AS (
         dh.ingredient_level
 ),
 
+DrugExposureWide AS (
+    SELECT
+        dcc.person_id,
+        dcc.test_date,
+        -- Haloperidol
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.cumulative_days_exposed END), 0) AS haloperidol_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_0_30d END), 0)          AS haloperidol_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_31_90d END), 0)         AS haloperidol_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_91_180d END), 0)        AS haloperidol_91_180d,
+
+    -- Lecanemab
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.cumulative_days_exposed END), 0) AS lecanemab_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_0_30d END), 0)           AS lecanemab_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_31_90d END), 0)          AS lecanemab_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_91_180d END), 0)         AS lecanemab_91_180d,
+
+    -- Donanemab
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.cumulative_days_exposed END), 0) AS donanemab_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_0_30d END), 0)           AS donanemab_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_31_90d END), 0)          AS donanemab_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_91_180d END), 0)         AS donanemab_91_180d,
+
+    -- Brexpiprazole
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.cumulative_days_exposed END), 0) AS brexpiprazole_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_0_30d END), 0)           AS brexpiprazole_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_31_90d END), 0)          AS brexpiprazole_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_91_180d END), 0)         AS brexpiprazole_91_180d,
+
+    -- Memantine
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.cumulative_days_exposed END), 0) AS memantine_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_0_30d END), 0)           AS memantine_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_31_90d END), 0)          AS memantine_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_91_180d END), 0)         AS memantine_91_180d,
+
+    -- Donepezil
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.cumulative_days_exposed END), 0) AS donepezil_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_0_30d END), 0)           AS donepezil_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_31_90d END), 0)          AS donepezil_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_91_180d END), 0)         AS donepezil_91_180d,
+
+    -- Rivastigmine
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.cumulative_days_exposed END), 0) AS rivastigmine_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_0_30d END), 0)           AS rivastigmine_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_31_90d END), 0)          AS rivastigmine_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_91_180d END), 0)         AS rivastigmine_91_180d,
+
+    -- Galantamine
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.cumulative_days_exposed END), 0) AS galantamine_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_0_30d END), 0)           AS galantamine_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_31_90d END), 0)          AS galantamine_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_91_180d END), 0)         AS galantamine_91_180d,
+
+    -- Benzgalantamine
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.cumulative_days_exposed END), 0) AS benzgalantamine_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_0_30d END), 0)           AS benzgalantamine_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_31_90d END), 0)          AS benzgalantamine_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_91_180d END), 0)         AS benzgalantamine_91_180d,
+
+    -- Suvorexant
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.cumulative_days_exposed END), 0) AS suvorexant_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_0_30d END), 0)           AS suvorexant_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_31_90d END), 0)          AS suvorexant_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_91_180d END), 0)         AS suvorexant_91_180d,
+
+    -- Risperidone
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.cumulative_days_exposed END), 0) AS risperidone_days,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_0_30d END), 0)           AS risperidone_0_30d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_31_90d END), 0)          AS risperidone_31_90d,
+    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_91_180d END), 0)         AS risperidone_91_180d
+    FROM drug_cohort_collapsed dcc
+    LEFT JOIN drug_hierarchy dh
+        ON dcc.drug_concept_id = dh.drug_concept_id
+    GROUP BY dcc.person_id, dcc.test_date
+),
+
 -- person demographics with unknown concepts labeled rather than excluded
 Demographics AS (
-    SELECT
+    SELECT DISTINCT
         p.person_id,
         CASE
             WHEN p.year_of_birth IS NULL THEN NULL
@@ -295,13 +393,14 @@ LabsCohort AS (
         1092155, 1259491, 3011498, 3029139, 3042151,
         1761505, 1617650, 1616613, 3042810, 42868555, 1617024
     )
-      AND m.value_as_number IS NOT NULL
+      --AND m.value_as_number IS NOT NULL
 ),
 
 -- Row-number + lag to identify most-recent value and its predecessor
 LabsRanked AS (
     SELECT
         person_id,
+        measurement_id,
         measurement_concept_id,
         measurement_datetime,
         value_as_number,
@@ -320,25 +419,20 @@ LabsRanked AS (
     FROM LabsCohort
 ),
 
--- Most-recent row per person per concept
 LabsMostRecent AS (
     SELECT
         csr.person_id,
+        measurement_id,
         csr.measurement_date AS test_date,
-        lc.measurement_concept_id,
-        lc.value_as_number as most_recent_score,
-        lc.measurement_datetime,
-
-        -- previous lab BEFORE this test_date
-        LAG(lc.value_as_number) OVER (
-            PARTITION BY csr.person_id, lc.measurement_concept_id, csr.measurement_date
-            ORDER BY lc.measurement_datetime
-        ) AS previous_value
-
+        lr.measurement_concept_id,
+        lr.value_as_number AS most_recent_score,
+        lr.measurement_datetime,
+        lr.previous_score AS previous_value
     FROM CogScoreWithDelta csr
-    JOIN LabsCohort lc
-        ON lc.person_id = csr.person_id
-       AND lc.measurement_datetime <= csr.measurement_date
+    JOIN LabsRanked lr
+        ON lr.person_id = csr.person_id
+       AND lr.measurement_datetime <= csr.measurement_date
+       AND lr.rn = 1 
 ),
 
 -- Rolling 90-day mean/median anchored to each person's most-recent measurement
@@ -355,7 +449,7 @@ LabsRollingStats AS (
     FROM CogScoreWithDelta csr
     JOIN LabsCohort lc
         ON lc.person_id = csr.person_id
-       AND lc.measurement_datetime BETWEEN DATEADD(DAY, -90, csr.measurement_date)
+       AND lc.measurement_datetime BETWEEN csr.measurement_date - INTERVAL 90 DAY
                                       AND csr.measurement_date
     GROUP BY csr.person_id, csr.measurement_date, lc.measurement_concept_id
 ),
@@ -376,6 +470,7 @@ LabsFlag AS (
         ON lp.person_id = m.person_id
        AND lp.measurement_concept_id = m.measurement_concept_id
        AND lp.measurement_datetime = m.measurement_datetime
+       AND m.measurement_id = lp.measurement_id
 ),
 
 -- Collapse all lab metrics to one wide row per person via conditional aggregation
@@ -519,177 +614,183 @@ ProceduresPerTest AS (
     SELECT
         csr.person_id,
         csr.measurement_date AS test_date,
-        p.procedure_concept_id,
 
         -- CONCEPT: 2211329 computed tomography, head or brain; without contrast material, followed by contrast material(s) and further sections
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2211329'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2211329,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2211329'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2211329,
 
         -- CONCEPT: 2211328 computed tomography, head or brain; with contrast material(s)
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2211328'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2211328,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2211328'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2211328,
 
         -- CONCEPT: 2211327 computed tomography, head or brain; without contrast material
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2211327'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2211327,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2211327'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2211327,
 
         -- CONCEPT: 2211332 computed tomography, orbit, sella, or posterior fossa or outer, middle, or inner ear; without contrast material, followed by contrast material(s) and further sections  
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2211332'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2211332,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2211332'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2211332,
 
         -- CONCEPT: 2211330 computed tomography, orbit, sella, or posterior fossa or outer, middle, or inner ear; without contrast material
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2211330'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2211330,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2211330'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2211330,
 
         -- CONCEPT: 2211353 magnetic resonance (eg, proton) imaging, brain (including brain stem); without contrast material, followed by contrast material(s) and further sequences 
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2211353'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2211353,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2211353'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2211353,
 
         -- CONCEPT: 2211351 magnetic resonance (eg, proton) imaging, brain (including brain stem); without contrast material  
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2211351'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2211351,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2211351'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2211351,
 
         -- CONCEPT: 2211719 magnetic resonance spectroscopy 
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2211719'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2211719,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2211719'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2211719,
 
         -- CONCEPT: 2212018 brain imaging, positron emission tomography (pet); metabolic evaluation   
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2212018'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2212018,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2212018'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2212018,
 
         -- CONCEPT: 2212056 positron emission tomography (pet) with concurrently acquired computed tomography (ct) for attenuation correction and anatomical localization imaging; limited area (eg, chest, head/neck)    
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2212056'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2212056,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2212056'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2212056,
 
         -- CONCEPT: 2212053 positron emission tomography (pet) imaging; limited area (eg, chest, head/neck)
         COUNT(DISTINCT CASE
             WHEN p.procedure_concept_id = '2212053'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -180, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 180 DAY
+                                      AND csr.measurement_date
             THEN p.procedure_date
         END) AS procedure_count_180d_2212053,
 
         MAX(CASE
             WHEN p.procedure_concept_id = '2212053'
-             AND p.procedure_date BETWEEN DATEADD(DAY, -90, csr.measurement_date)
-                                  AND csr.measurement_date
+             AND p.procedure_date BETWEEN csr.measurement_date - INTERVAL 90 DAY
+                                      AND csr.measurement_date
             THEN 1 ELSE 0
         END) AS procedure_within_90d_2212053
 
     FROM CogScoreWithDelta csr
-    LEFT JOIN procedure_occurrence p
-        ON p.person_id = csr.person_id
-    GROUP BY csr.person_id, csr.measurement_date, p.procedure_concept_id
+    LEFT JOIN (
+        -- pre-filter to only your target concept IDs before joining
+        SELECT person_id, procedure_concept_id, procedure_date
+        FROM procedure_occurrence
+        WHERE procedure_concept_id IN (
+            '2211329','2211328','2211327','2211332','2211330',
+            '2211353','2211351','2211719','2212018','2212056','2212053'
+        )
+    ) p ON p.person_id = csr.person_id
+    GROUP BY csr.person_id, csr.measurement_date
 )
 
 -- Final output: one row per person per drug exposure record
@@ -717,71 +818,60 @@ SELECT
     d.ethnicity_hispanic_or_latino,
     d.ethnicity_unknown,
 
-    -- Haloperidol
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.cumulative_days_exposed END), 0) AS haloperidol_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_0_30d END), 0)          AS haloperidol_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_31_90d END), 0)         AS haloperidol_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%haloperidol%'     THEN dcc.exposed_91_180d END), 0)        AS haloperidol_91_180d,
+    dew.haloperidol_days,
+    dew.haloperidol_0_30d,
+    dew.haloperidol_31_90d,
+    dew.haloperidol_91_180d,
 
-    -- Lecanemab
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.cumulative_days_exposed END), 0) AS lecanemab_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_0_30d END), 0)           AS lecanemab_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_31_90d END), 0)          AS lecanemab_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%lecanemab%'       THEN dcc.exposed_91_180d END), 0)         AS lecanemab_91_180d,
+    dew.lecanemab_days,
+    dew.lecanemab_0_30d,
+    dew.lecanemab_31_90d,
+    dew.lecanemab_91_180d,
 
-    -- Donanemab
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.cumulative_days_exposed END), 0) AS donanemab_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_0_30d END), 0)           AS donanemab_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_31_90d END), 0)          AS donanemab_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donanemab%'       THEN dcc.exposed_91_180d END), 0)         AS donanemab_91_180d,
+    dew.donanemab_days,
+    dew.donanemab_0_30d,
+    dew.donanemab_31_90d,
+    dew.donanemab_91_180d,
 
-    -- Brexpiprazole
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.cumulative_days_exposed END), 0) AS brexpiprazole_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_0_30d END), 0)           AS brexpiprazole_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_31_90d END), 0)          AS brexpiprazole_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%brexpiprazole%'   THEN dcc.exposed_91_180d END), 0)         AS brexpiprazole_91_180d,
+    dew.brexpiprazole_days,
+    dew.brexpiprazole_0_30d,
+    dew.brexpiprazole_31_90d,
+    dew.brexpiprazole_91_180d,
 
-    -- Memantine
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.cumulative_days_exposed END), 0) AS memantine_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_0_30d END), 0)           AS memantine_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_31_90d END), 0)          AS memantine_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%memantine%'       THEN dcc.exposed_91_180d END), 0)         AS memantine_91_180d,
+    dew.memantine_days,
+    dew.memantine_0_30d,
+    dew.memantine_31_90d,
+    dew.memantine_91_180d,
 
-    -- Donepezil
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.cumulative_days_exposed END), 0) AS donepezil_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_0_30d END), 0)           AS donepezil_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_31_90d END), 0)          AS donepezil_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%donepezil%'       THEN dcc.exposed_91_180d END), 0)         AS donepezil_91_180d,
+    dew.donepezil_days,
+    dew.donepezil_0_30d,
+    dew.donepezil_31_90d,
+    dew.donepezil_91_180d,
 
-    -- Rivastigmine
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.cumulative_days_exposed END), 0) AS rivastigmine_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_0_30d END), 0)           AS rivastigmine_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_31_90d END), 0)          AS rivastigmine_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%rivastigmine%'    THEN dcc.exposed_91_180d END), 0)         AS rivastigmine_91_180d,
+    dew.rivastigmine_days,
+    dew.rivastigmine_0_30d,
+    dew.rivastigmine_31_90d,
+    dew.rivastigmine_91_180d,
 
-    -- Galantamine
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.cumulative_days_exposed END), 0) AS galantamine_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_0_30d END), 0)           AS galantamine_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_31_90d END), 0)          AS galantamine_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%galantamine%'     THEN dcc.exposed_91_180d END), 0)         AS galantamine_91_180d,
+    dew.galantamine_days,
+    dew.galantamine_0_30d,
+    dew.galantamine_31_90d,
+    dew.galantamine_91_180d,
 
-    -- Benzgalantamine
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.cumulative_days_exposed END), 0) AS benzgalantamine_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_0_30d END), 0)           AS benzgalantamine_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_31_90d END), 0)          AS benzgalantamine_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%benzgalantamine%' THEN dcc.exposed_91_180d END), 0)         AS benzgalantamine_91_180d,
+    dew.benzgalantamine_days,
+    dew.benzgalantamine_0_30d,
+    dew.benzgalantamine_31_90d,
+    dew.benzgalantamine_91_180d,
 
-    -- Suvorexant
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.cumulative_days_exposed END), 0) AS suvorexant_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_0_30d END), 0)           AS suvorexant_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_31_90d END), 0)          AS suvorexant_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%suvorexant%'      THEN dcc.exposed_91_180d END), 0)         AS suvorexant_91_180d,
+    dew.suvorexant_days,
+    dew.suvorexant_0_30d,
+    dew.suvorexant_31_90d,
+    dew.suvorexant_91_180d,
 
-    -- Risperidone
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.cumulative_days_exposed END), 0) AS risperidone_days,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_0_30d END), 0)           AS risperidone_0_30d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_31_90d END), 0)          AS risperidone_31_90d,
-    COALESCE(MAX(CASE WHEN dh.ingredient_level LIKE '%risperidone%'     THEN dcc.exposed_91_180d END), 0)         AS risperidone_91_180d,
+    dew.risperidone_days,
+    dew.risperidone_0_30d,
+    dew.risperidone_31_90d,
+    dew.risperidone_91_180d,
 
     -- ==========================================================
     -- 3. LAB METRICS (Most Recent, Mean 90d, Median 90d, Flag)
@@ -825,7 +915,7 @@ SELECT
     COALESCE(pr.procedure_count_180d_2212018, 0) AS pr_2212018_ct, COALESCE(pr.procedure_within_90d_2212018, 0) AS pr_2212018_90d,
     COALESCE(pr.procedure_count_180d_2212056, 0) AS pr_2212056_ct, COALESCE(pr.procedure_within_90d_2212056, 0) AS pr_2212056_90d,
     COALESCE(pr.procedure_count_180d_2212053, 0) AS pr_2212053_ct, COALESCE(pr.procedure_within_90d_2212053, 0) AS pr_2212053_90d
-    
+
 FROM CogScoreWithDelta csr
 LEFT JOIN EligibleCohort ec 
     on csr.person_id = ec.person_id
@@ -837,66 +927,8 @@ LEFT JOIN ProceduresPerTest pr
     AND csr.measurement_date = pr.test_date
 JOIN Demographics d
     ON ec.person_id = d.person_id
-JOIN drug_cohort_collapsed dcc
-    ON ec.person_id = dcc.person_id
-    AND dcc.test_date = csr.measurement_date
-LEFT JOIN drug_hierarchy dh
-    ON dcc.drug_concept_id = dh.drug_concept_id
-GROUP BY
-    ec.person_id,
-    ec.index_date,
-    d.age_at_index,
-    
-    d.sex_male,
-    d.sex_female,
-    d.sex_unknown,
-    d.race_white,
-    d.race_black_or_african_american,
-    d.race_asian,
-    d.race_american_indian_or_alaska_native,
-    d.race_native_hawaiian_or_other_pacific_islander,
-    d.race_other,
-    d.race_unknown,
-    d.ethnicity_not_hispanic_or_latino,
-    d.ethnicity_hispanic_or_latino,
-    d.ethnicity_unknown,
-    
-    csr.measurement_date,
-    csr.scale,
-    csr.cutoff_score,
-    csr.prev_test_date,
-    csr.prev_score,
-    csr.score_delta_from_last,
-    csr.trajectory,
+LEFT JOIN DrugExposureWide dew
+    ON ec.person_id = dew.person_id
+    AND csr.measurement_date = dew.test_date
 
-    -- please god please work
-
-    lab_3003722_recent, lab_3003722_mean, lab_3003722_median, lab_3003722_abn,
-    lab_3050174_recent, lab_3050174_mean, lab_3050174_median, lab_3050174_abn,
-    lab_3043102_recent, lab_3043102_mean, lab_3043102_median, lab_3043102_abn,
-    lab_42868556_recent, lab_42868556_mean, lab_42868556_median, lab_42868556_abn,
-    lab_1469579_recent, lab_1469579_mean, lab_1469579_median, lab_1469579_abn,
-    lab_1092155_recent, lab_1092155_mean, lab_1092155_median, lab_1092155_abn,
-    lab_1259491_recent, lab_1259491_mean, lab_1259491_median, lab_1259491_abn,
-    lab_3011498_recent, lab_3011498_mean, lab_3011498_median, lab_3011498_abn,
-    lab_3029139_recent, lab_3029139_mean, lab_3029139_median, lab_3029139_abn,
-    lab_3042151_recent, lab_3042151_mean, lab_3042151_median, lab_3042151_abn,
-    lab_1761505_recent, lab_1761505_mean, lab_1761505_median, lab_1761505_abn,
-    lab_1617650_recent, lab_1617650_mean, lab_1617650_median, lab_1617650_abn,
-    lab_1616613_recent, lab_1616613_mean,  lab_1616613_median, lab_1616613_abn,
-    lab_3042810_recent, lab_3042810_mean, lab_3042810_median, lab_3042810_abn,
-    lab_42868555_recent, lab_42868555_mean, lab_42868555_median, lab_42868555_abn,
-    lab_1617024_recent, lab_1617024_mean, lab_1617024_median, lab_1617024_abn,
-
-    pr_2211329_ct, pr_2211329_90d,
-    pr_2211328_ct, pr_2211328_90d,
-    pr_2211327_ct, pr_2211327_90d,
-    pr_2211332_ct, pr_2211332_90d,
-    pr_2211330_ct, pr_2211330_90d,
-    pr_2211353_ct, pr_2211353_90d,
-    pr_2211351_ct, pr_2211351_90d,
-    pr_2211719_ct, pr_2211719_90d,
-    pr_2212018_ct, pr_2212018_90d,
-    pr_2212056_ct, pr_2212056_90d,
-    pr_2212053_ct, pr_2212053_90d
 ORDER BY ec.person_id, csr.measurement_date
