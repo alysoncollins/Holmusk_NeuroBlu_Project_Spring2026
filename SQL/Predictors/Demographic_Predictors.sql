@@ -17,7 +17,8 @@ INNER JOIN demographic_index i ON p.person_id = i.person_id
 LEFT JOIN concept g ON p.gender_concept_id = g.concept_id
 LEFT JOIN concept r ON p.race_concept_id = r.concept_id
 LEFT JOIN concept e ON p.ethnicity_concept_id = e.concept_id
-WHERE 
-    LOWER(g.concept_name) NOT LIKE '%no matching concept%' AND
-    LOWER(r.concept_name) NOT LIKE '%no matching concept%' AND
-    LOWER(e.concept_name) NOT LIKE '%no matching concept%';
+---We should consider the values that are no matching concept
+-- WHERE 
+--     LOWER(g.concept_name) NOT LIKE '%no matching concept%' AND
+--     LOWER(r.concept_name) NOT LIKE '%no matching concept%' AND
+--     LOWER(e.concept_name) NOT LIKE '%no matching concept%';
