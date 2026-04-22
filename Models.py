@@ -16,7 +16,7 @@ import numpy as np
 import Graph
 import matplotlib.pyplot as plt
 from sklearn.experimental import enable_halving_search_cv
-from sklearn.model_selection import HalvingRandomSearchCV, StratifiedKFold
+from sklearn.model_selection import HalvingRandomSearchCV
 from scipy.stats import randint, uniform
 
 def get_feature_importance(model, feature_names):
@@ -96,10 +96,10 @@ def evaluate_model(model, name, X_train, Y_train, X_test, Y_test, target_names, 
     plt.savefig(f"pr_curve_{name.replace(' ', '_')}.png", bbox_inches='tight', dpi=150)
     plt.close()
 
-    #importance = get_feature_importance(model, feature_names)
-    #print(f"\n--- {name} Feature Importance ---")
-    #print(importance)
-    #Graph.shap_plots(model, X_test, feature_names, target_names, name.lower().replace(" ", "_"))
+    importance = get_feature_importance(model, feature_names)
+    print(f"\n--- {name} Feature Importance ---")
+    print(importance)
+    Graph.shap_plots(model, X_test, feature_names, target_names, name.lower().replace(" ", "_"))
     
 
 def randomforest_model(X_train, Y_train, X_test, Y_test, target_names, feature_names, groups, threshold=0.3):
